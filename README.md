@@ -1,29 +1,29 @@
-# Welcome to Colyseus!
+# mafia-server
 
-This project has been created using [⚔️ `create-colyseus-app`](https://github.com/colyseus/create-colyseus-app/) - an npm init template for kick starting a Colyseus project in TypeScript.
+Ігровий сервер «Мафії» на [Colyseus](https://docs.colyseus.io/) — реалізує кімнату `mafia_room` (лобі, запрошення за токеном, розсадка гравців).
 
-[Documentation](http://docs.colyseus.io/)
-
-## :crossed_swords: Usage
+## Запуск
 
 ```
-npm start
+npm install
+npm start        # dev-сервер з hot-reload на ws://localhost:2567
 ```
 
-## Structure
+## Тести
 
-- `index.ts`: main entry point, register an empty room handler and attach [`@colyseus/monitor`](https://github.com/colyseus/colyseus-monitor)
-- `src/rooms/MyRoom.ts`: an empty room handler for you to implement your logic
-- `src/rooms/schema/MyRoomState.ts`: an empty schema used on your room's state.
-- `loadtest/example.ts`: scriptable client for the loadtest tool (see `npm run loadtest`)
-- `package.json`:
-    - `scripts`:
-        - `npm start`: runs `ts-node-dev index.ts`
-        - `npm test`: runs mocha test suite
-        - `npm run loadtest`: runs the [`@colyseus/loadtest`](https://github.com/colyseus/colyseus-loadtest/) tool for testing the connection, using the `loadtest/example.ts` script.
-- `tsconfig.json`: TypeScript configuration file
+```
+npm test         # mocha + @colyseus/testing (тест boot'ить сервер у процесі)
+```
 
+## Структура
 
-## License
+- `src/rooms/MafiaRoom.ts` — логіка кімнати: токен запрошення (TTL 6 годин), вхід гравців, хост, `setMaxPlayers`, `shuffle_players`, `startGame`
+- `src/rooms/schema/MafiaState.ts` — схема стану (гравці, фаза, налаштування кімнати)
+- `src/app.config.ts` — реєстрація кімнати; у dev монтується playground (`/`)
+- `test/mafia-room.test.ts` — інтеграційні тести кімнати
 
-MIT
+## Поведінка входу
+
+- Творець кімнати (перший клієнт) підключається без токена — його `guestId` стає `hostId`.
+- Усі наступні клієнти входять за `token` з інвайт-посилання (`/room/{roomId}#token=...`).
+- Повторне підключення з тим самим `guestId` відновлює слот гравця.

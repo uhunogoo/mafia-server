@@ -2,7 +2,7 @@ import assert from "assert";
 import { ColyseusTestServer, boot } from "@colyseus/testing";
 
 import appConfig from "../src/app.config.js";
-import { MafiaState } from "../src/rooms/schema/MyRoomState.js";
+import { MafiaState } from "../src/rooms/schema/MafiaState.js";
 
 describe("mafia_room", () => {
   let colyseus: ColyseusTestServer<typeof appConfig>;

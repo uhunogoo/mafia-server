@@ -1,26 +1,20 @@
 import { Room, Client, ServerError } from "@colyseus/core";
-import { MafiaState, Player, ChatMessage } from "./schema/MyRoomState.js";
-import crypto from "crypto";
+import { MafiaState, Player } from "./schema/MafiaState.js";
 
 const INVITE_TTL_MS = 1000 * 60 * 60 * 6; // 6 годин
-
-type AuthData = {
-  verifiedGuestId?: string;
-  asSpectator: boolean;
-};
 
 export class MafiaRoom extends Room {
   maxClients = 12;
   state = new MafiaState();
 
-  private inviteToken!: string;
-  private inviteCreatedAt!: number;
+  private inviteToken?: string;
+  private inviteCreatedAt = 0;
 
   messages = {
-    chat: (client: Client, payload: { text: string }) => {
+    chat: (_client: Client, _payload: { text: string }) => {
       console.log("global chat");
     },
-    vote: (client: Client, payload: { targetId: string }) => {
+    vote: (_client: Client, _payload: { targetId: string }) => {
       console.log("voting");
     },
     startGame: (client: Client) => {
@@ -68,7 +62,7 @@ export class MafiaRoom extends Room {
       nonHosts.forEach((player, i) => {
         player.seatIndex = seats[i];
       });
-    }
+    },
   };
 
   onCreate(options: { token?: string, guestId?: string }) {
@@ -77,21 +71,15 @@ export class MafiaRoom extends Room {
     // Room settings
     this.inviteToken = options.token;
     this.inviteCreatedAt = Date.now();
-    this.state.hostId = options.guestId;
+    this.state.hostId = options.guestId ?? "";
 
     // Auto clear
     this.autoDispose = true;
   }
 
-  async onAuth(client: Client, options: { token?: string, guestId?: string, name?: string, spectator?: boolean }) {
-    const asSpectator = options.spectator === true || !options.name;
-
-    if (this.clients.length === 0) {
-      return {
-        verifiedGuestId: options.guestId,
-        asSpectator,
-      };
-    }
+  async onAuth(_client: Client, options: { token?: string, guestId?: string, name?: string }) {
+    // Перший клієнт — творець кімнати: токена в нього ще немає
+    if (this.clients.length === 0) return true;
 
     if (options.token !== this.inviteToken) {
       throw new Error("Невірне посилання");
@@ -100,23 +88,10 @@ export class MafiaRoom extends Room {
       throw new Error("Посилання застаріло");
     }
 
-    return {
-      verifiedGuestId: options.guestId,
-      asSpectator,
-    };
+    return true;
   }
 
-  onJoin(client: Client, options: { name: string; guestId: string; spectator?: boolean }, auth: AuthData) {
-    // Зберігаємо auth для доступу в messages
-    (client as any).auth = auth;
-
-    // Глядач: підключається до кімнати, але НЕ додається в state.players
-    if (auth.asSpectator) {
-      client.send("show_form", { roomExists: true });
-      console.log(`Глядач підключився, чекає форму`);
-      return;
-    }
-
+  onJoin(client: Client, options: { name: string, guestId: string }) {
     if (!options.name || !options.guestId) return;
     const isHost = options.guestId === this.state.hostId;
     const existedPlayer = this.state.players.get(options.guestId);
@@ -125,6 +100,10 @@ export class MafiaRoom extends Room {
       existedPlayer.sessionId = client.sessionId;
       console.log(`${existedPlayer.name} перепідключився`);
       return;
+    }
+
+    if (this.state.players.size >= this.state.maxPlayers) {
+      throw new ServerError(4004, "Кімната заповнена");
     }
 
     const player = new Player();
@@ -140,16 +119,11 @@ export class MafiaRoom extends Room {
     const playerEntry = [...this.state.players.entries()].find(
       ([_, p]) => p.sessionId === client.sessionId
     );
-
     if (!playerEntry) return;
-    const [guestId, player] = playerEntry;
 
+    const [guestId, player] = playerEntry;
     console.log(`Гравець ${player.name} (${guestId}) відключився`);
   }
 
   onDispose() {}
-
-  private assignRoles() {
-    console.log("roles asigning");
-  }
 }
