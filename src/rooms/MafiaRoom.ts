@@ -11,8 +11,8 @@ export class MafiaRoom extends Room {
   private inviteCreatedAt = 0;
 
   messages = {
-    chat: (_client: Client, _payload: { text: string }) => {
-      console.log("global chat");
+    log: (_client: Client, _payload: { text: string }) => {
+      console.log("global log");
     },
     vote: (_client: Client, _payload: { targetId: string }) => {
       console.log("voting");
