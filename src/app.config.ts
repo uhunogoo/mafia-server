@@ -4,7 +4,7 @@ import { MafiaRoom } from "./rooms/MafiaRoom.js";
 
 const server = defineServer({
   rooms: {
-    mafia_room: defineRoom(MafiaRoom),
+    mafia_room: defineRoom(MafiaRoom).filterBy(['password']),
   },
 
   express: (app) => {

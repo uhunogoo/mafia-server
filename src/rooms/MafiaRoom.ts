@@ -1,5 +1,6 @@
 import { Room, Client, ServerError } from "@colyseus/core";
 import { MafiaState, Player } from "./schema/MafiaState.js";
+import { Auth } from "../config/auth.js";
 
 const INVITE_TTL_MS = 1000 * 60 * 60 * 6; // 6 годин
 
@@ -7,8 +8,10 @@ export class MafiaRoom extends Room {
   maxClients = 12;
   state = new MafiaState();
 
-  private inviteToken?: string;
+  password: string | undefined;
   private inviteCreatedAt = 0;
+
+  private auth = new Auth(this);
 
   messages = {
     log: (_client: Client, _payload: { text: string }) => {
@@ -18,19 +21,12 @@ export class MafiaRoom extends Room {
       console.log("voting");
     },
     startGame: (client: Client) => {
-      const caller = [...this.state.players.values()].find(p => p.sessionId === client.sessionId);
-      if (!caller || !caller.isHost) {
-        client.send("error", "Тільки хост може почати гру");
-        return;
-      }
+      if (!this.requireHost(client)) return;
+
       console.log("game was started");
     },
     setMaxPlayers: (client: Client, payload: { maxPlayers: number }) => {
-      const caller = [...this.state.players.values()].find(p => p.sessionId === client.sessionId);
-      if (!caller || !caller.isHost) {
-        client.send("error", "Тільки хост може змінювати кількість гравців");
-        return;
-      }
+      if (!this.requireHost(client)) return;
 
       const value = payload?.maxPlayers;
       if (!Number.isInteger(value) || value < 6 || value > 12) {
@@ -46,84 +42,55 @@ export class MafiaRoom extends Room {
       this.state.maxPlayers = value;
     },
     shuffle_players: (client: Client) => {
-      const caller = [...this.state.players.values()].find(p => p.sessionId === client.sessionId);
-      if (!caller || !caller.isHost) return;
+      if (!this.requireHost(client)) return;
 
-      const nonHosts = [...this.state.players.values()].filter(p => !p.isHost);
-      const seats = nonHosts.map(p => p.seatIndex);
+      const others = [...this.state.players.values()].filter((p) => !p.isHost);
+      const seats = others.map((p) => p.seatIndex);
 
-      // Тасуємо тільки номери місць
       for (let i = seats.length - 1; i > 0; i--) {
         const j = Math.floor(Math.random() * (i + 1));
         [seats[i], seats[j]] = [seats[j], seats[i]];
       }
 
-      // Призначаємо нові індекси — оновляться лише змінені поля
-      nonHosts.forEach((player, i) => {
-        player.seatIndex = seats[i];
-      });
+      others.forEach((p, i) => (p.seatIndex = seats[i]));
     },
   };
 
-  onCreate(options: { token?: string, guestId?: string }) {
-    this.setPrivate(true);
-
-    // Room settings
-    this.inviteToken = options.token;
-    this.inviteCreatedAt = Date.now();
-    this.state.hostId = options.guestId ?? "";
-
-    // Auto clear
-    this.autoDispose = true;
+  onCreate(options: { password: string }) {
+    if (options.password) {
+      this.password = options.password;
+      this.setMatchmaking({ unlisted: true });
+    }
   }
 
-  async onAuth(_client: Client, options: { token?: string, guestId?: string, name?: string }) {
-    // Перший клієнт — творець кімнати: токена в нього ще немає
-    if (this.clients.length === 0) return true;
-
-    if (options.token !== this.inviteToken) {
-      throw new Error("Невірне посилання");
-    }
-    if (Date.now() - this.inviteCreatedAt > INVITE_TTL_MS) {
-      throw new Error("Посилання застаріло");
-    }
-
-    return true;
+  async onAuth(client: Client, options: { name?: string }) {
+    return this.auth.onAuth(client, options);
   }
 
-  onJoin(client: Client, options: { name: string, guestId: string }) {
-    if (!options.name || !options.guestId) return;
-    const isHost = options.guestId === this.state.hostId;
-    const existedPlayer = this.state.players.get(options.guestId);
+  onJoin(client: Client) {
+    this.auth.onJoin(client);
+  }
 
-    if (existedPlayer) {
-      existedPlayer.sessionId = client.sessionId;
-      console.log(`${existedPlayer.name} перепідключився`);
-      return;
-    }
-
-    if (this.state.players.size >= this.state.maxPlayers) {
-      throw new ServerError(4004, "Кімната заповнена");
-    }
-
-    const player = new Player();
-    player.name = options.name;
-    player.sessionId = client.sessionId;
-    player.seatIndex = this.state.players.size;
-    player.isHost = isHost;
-    player.role = isHost ? "master" : "";
-    this.state.players.set(options.guestId, player);
+  onDrop(client: Client) {
+    this.auth.onDrop(client);
   }
 
   onLeave(client: Client) {
-    const playerEntry = [...this.state.players.entries()].find(
-      ([_, p]) => p.sessionId === client.sessionId
-    );
-    if (!playerEntry) return;
-
-    const [guestId, player] = playerEntry;
-    console.log(`Гравець ${player.name} (${guestId}) відключився`);
+    this.auth.onLeave(client);
   }
 
-  onDispose() {}
+  // ——— helpers ———
+  isInviteExpired(): boolean {
+    return Date.now() - this.inviteCreatedAt > INVITE_TTL_MS;
+  }
+
+  private requireHost(client: Client): boolean {
+    const ok = this.state.players.get(client.sessionId)?.isHost === true;
+    if (!ok) this.fail(client, "Тільки хост може це робити");
+    return ok;
+  }
+
+  private fail(client: Client, message: string) {
+    client.send("error", message);
+  }
 }
