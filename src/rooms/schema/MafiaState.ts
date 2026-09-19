@@ -40,4 +40,9 @@ export class MafiaState extends Schema {
 
   // For future day-phase work (not yet implemented).
   @type(["string"]) nominations = new ArraySchema<string>();
+
+  // Day-cycle pointers. Empty string means "no active speaker / defender".
+  // Updated by the engine as it walks through DAY_SPEECHES / DAY_DEFENSE.
+  @type("string") currentSpeakerId: string = "";
+  @type("string") currentDefenseId: string = "";
 }

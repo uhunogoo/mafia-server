@@ -75,6 +75,32 @@ export interface NightResolution {
 }
 
 /**
+ * Cause of death fired through the engine's `onPlayerDied` seam. The seam is
+ * a single subscription; the room uses it to react to elimination (currently
+ * logging and victory checks — those are follow-up tickets). Day-cycle
+ * elimination fires `VOTE_ELIMINATION`; night deaths use `MAFIA_KILL`;
+ * disconnect declarations use `DECLARED_DEAD`.
+ */
+export type DeathCause =
+  | "MAFIA_KILL"
+  | "VOTE_ELIMINATION"
+  | "DECLARED_DEAD";
+
+/**
+ * Result of resolving a day cycle's voting round. The engine applies this
+ * to the public schema (Player.isAlive, Player.votes) and returns a copy for
+ * tests and for the action log entry.
+ *
+ * `eliminatedId` is the sessionId of the eliminated player, or empty string
+ * when there were no candidates (no nominations → no elimination).
+ */
+export interface VoteResolution {
+  eliminatedId: string;
+  voteCounts: Record<string, number>;
+  totalVotes: number;
+}
+
+/**
  * A single ping between two players. Pings are ephemeral signals — no message
  * body — used for social coordination. The engine stores every ping it accepts
  * so the host's action log can replay them, and the room uses the record to

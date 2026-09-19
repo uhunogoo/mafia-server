@@ -318,10 +318,11 @@ describe("Engine вЂ” night resolution", () => {
     engine.doctorHeal("p3", "p4");
     engine.resolveNight();
 
-    // Night 2 starts (test-only: reset action buffer so we can submit again).
-    // Engine doesn't expose a night reset yet, so we simulate it by clearing
-    // internal state via resolveNight (already called above) and start a new
-    // night by clearing the action buffer manually.
+    // resolveNight now transitions to DAY_ANNOUNCEMENT (ticket 03). To test
+    // the next night's restriction without driving the whole day cycle, we
+    // manually put the engine back into NIGHT and clear the action buffer.
+    engine.state.phase = GamePhase.NIGHT;
+    engine.state.nightStep = NightStep.MAFIA;
     (engine as unknown as { nightActions: unknown }).nightActions = {
       mafiaVictimId: "",
       donCheck: null,
@@ -563,5 +564,501 @@ describe("Engine -- pings", () => {
     assert.strictEqual(all.length, 1);
     assert.strictEqual(all[0].fromId, "p0");
     assert.strictEqual(all[0].toId, "p1");
+  });
+});
+
+// ─── Ticket 03: Day-1 basic flow ───────────────────────────────────────
+
+describe("Engine — resolveNight → day cycle entry", () => {
+  it("resolveNight transitions to DAY_ANNOUNCEMENT and increments dayCount to 1", () => {
+    const { state, engine } = ((): { state: MafiaState; engine: Engine } => {
+      const state = freshState(10);
+      const engine = new Engine(state);
+      engine.startGame();
+      engine._assignRoleForTest("p3", Role.DOCTOR);
+      return { state, engine };
+    })();
+
+    engine.mafiaKill("host", "p4");
+    engine.doctorHeal("p3", "p5");
+    engine.resolveNight();
+
+    assert.strictEqual(state.phase, GamePhase.DAY_ANNOUNCEMENT);
+    assert.strictEqual(state.dayCount, 1);
+    assert.strictEqual(state.died, "p4");
+  });
+
+  it("resolveNight with no deaths still enters DAY_ANNOUNCEMENT", () => {
+    const { state, engine } = ((): { state: MafiaState; engine: Engine } => {
+      const state = freshState(10);
+      const engine = new Engine(state);
+      engine.startGame();
+      engine._assignRoleForTest("p3", Role.DOCTOR);
+      return { state, engine };
+    })();
+
+    engine.mafiaKill("host", "p4");
+    engine.doctorHeal("p3", "p4");
+    engine.resolveNight();
+
+    assert.strictEqual(state.phase, GamePhase.DAY_ANNOUNCEMENT);
+    assert.strictEqual(state.dayCount, 1);
+    assert.strictEqual(state.died, "");
+  });
+
+  it("resolveNight clears night action targets and the next-night Doctor restriction is preserved", () => {
+    const { state, engine } = ((): { state: MafiaState; engine: Engine } => {
+      const state = freshState(10);
+      const engine = new Engine(state);
+      engine.startGame();
+      engine._assignRoleForTest("p3", Role.DOCTOR);
+      return { state, engine };
+    })();
+
+    engine.mafiaKill("host", "p4");
+    engine.doctorHeal("p3", "p5");
+    engine.resolveNight();
+
+    assert.strictEqual(state.mafiaTargetId, "");
+    assert.strictEqual(state.doctorTargetId, "");
+    // Doctor healed p5 last night — should still be in the engine's lastHealed
+    // map so the next night rejects a repeat heal.
+    assert.strictEqual(engine.getLastHealed("p3"), "p5");
+  });
+});
+
+describe("Engine — Day 1 phase sequence (no BALAGAN, ADR 0005)", () => {
+  /**
+   * Drive a full Day 1 cycle from NIGHT through to the next NIGHT.
+   * Mirrors the integration test, but without Colyseus — exercises the
+   * engine's state-machine surface directly.
+   */
+  function driveNightThenDay(): Engine {
+    const state = freshState(10);
+    const engine = new Engine(state);
+    engine.startGame();
+    engine._assignRoleForTest("p3", Role.DOCTOR);
+    // Mafia kills p4; Doctor saves p4 → no one dies, so the speaking order
+    // still has all 10 players.
+    engine.mafiaKill("host", "p4");
+    engine.doctorHeal("p3", "p4");
+    engine.resolveNight();
+    return engine;
+  }
+
+  it("startSpeeches: transitions to DAY_SPEECHES and points at the first alive player", () => {
+    const engine = driveNightThenDay();
+    engine.startSpeeches();
+    assert.strictEqual(engine.state.phase, GamePhase.DAY_SPEECHES);
+    assert.strictEqual(engine.getCurrentSpeaker(), "p0");
+    assert.strictEqual(engine.getSpeakingOrder()[0], "p0");
+  });
+
+  it("nextSpeaker advances clockwise; on the last call it auto-transitions to DAY_DEFENSE (Day 1 skips BALAGAN)", () => {
+    const engine = driveNightThenDay();
+    engine.startSpeeches();
+    const order = engine.getSpeakingOrder();
+    assert.strictEqual(order.length, 10);
+
+    for (let i = 1; i < order.length; i++) {
+      engine.nextSpeaker();
+      assert.strictEqual(engine.getCurrentSpeaker(), order[i]);
+    }
+    // One more nextSpeaker finishes the round.
+    engine.nextSpeaker();
+    assert.strictEqual(engine.getCurrentSpeaker(), "");
+    assert.strictEqual(engine.state.phase, GamePhase.DAY_DEFENSE);
+  });
+
+  it("startSpeeches rejects if the engine is not in DAY_ANNOUNCEMENT", () => {
+    const engine = driveNightThenDay();
+    // engine is in DAY_ANNOUNCEMENT; first startSpeeches succeeds.
+    engine.startSpeeches();
+    assert.throws(() => engine.startSpeeches(), (err: unknown) => {
+      return (err as { code: string }).code === EngineErrorCode.WRONG_PHASE;
+    });
+  });
+
+  it("nextSpeaker rejects outside DAY_SPEECHES", () => {
+    const engine = driveNightThenDay();
+    assert.throws(() => engine.nextSpeaker(), (err: unknown) => {
+      return (err as { code: string }).code === EngineErrorCode.WRONG_PHASE;
+    });
+  });
+
+  it("dead players are skipped in the speaking order", () => {
+    const engine = driveNightThenDay();
+    // Mark p3 (doctor) dead before speeches — p3 should be skipped.
+    engine.state.players.get("p3")!.isAlive = false;
+    engine.startSpeeches();
+
+    const order = engine.getSpeakingOrder();
+    assert.ok(!order.includes("p3"), "dead player p3 should not be in speaking order");
+    // All other players should still be present.
+    for (let i = 0; i < 10; i++) {
+      if (i === 3) continue;
+      assert.ok(order.includes(`p${i}`), `p${i} should be in speaking order`);
+    }
+  });
+});
+
+describe("Engine — nominations", () => {
+  function inDay1Speeches(): Engine {
+    const state = freshState(10);
+    const engine = new Engine(state);
+    engine.startGame();
+    engine._assignRoleForTest("p3", Role.DOCTOR);
+    engine.mafiaKill("host", "p4");
+    engine.doctorHeal("p3", "p5");
+    engine.resolveNight();
+    engine.startSpeeches();
+    return engine;
+  }
+
+  it("nominate adds the target to state.nominations and marks Player.isNominated", () => {
+    const engine = inDay1Speeches();
+    engine.nominate("p0", "p6");
+    assert.deepStrictEqual([...engine.state.nominations], ["p6"]);
+    assert.strictEqual(engine.state.players.get("p6")!.isNominated, true);
+    assert.strictEqual(engine.state.players.get("p7")!.isNominated, false);
+  });
+
+  it("multiple nominations append in order", () => {
+    const engine = inDay1Speeches();
+    engine.nominate("p0", "p6");
+    engine.nominate("p1", "p7");
+    engine.nominate("p2", "p8");
+    assert.deepStrictEqual([...engine.state.nominations], ["p6", "p7", "p8"]);
+  });
+
+  it("nominate rejects nominations for already-nominated players", () => {
+    const engine = inDay1Speeches();
+    engine.nominate("p0", "p6");
+    assert.throws(() => engine.nominate("p1", "p6"), (err: unknown) => {
+      return (err as { code: string }).code === EngineErrorCode.WRONG_ROLE;
+    });
+  });
+
+  it("nominate rejects nominations for dead players", () => {
+    const engine = inDay1Speeches();
+    engine.state.players.get("p6")!.isAlive = false;
+    assert.throws(() => engine.nominate("p0", "p6"), (err: unknown) => {
+      return (err as { code: string }).code === EngineErrorCode.PLAYER_DEAD;
+    });
+  });
+
+  it("nominate rejects nominations by dead actors", () => {
+    const engine = inDay1Speeches();
+    engine.state.players.get("p0")!.isAlive = false;
+    assert.throws(() => engine.nominate("p0", "p6"), (err: unknown) => {
+      return (err as { code: string }).code === EngineErrorCode.PLAYER_DEAD;
+    });
+  });
+
+  it("nominate is rejected outside DAY_SPEECHES (Day 1 doesn't have BALAGAN)", () => {
+    const state = freshState(10);
+    const engine = new Engine(state);
+    engine.startGame();
+    assert.throws(() => engine.nominate("p0", "p4"), (err: unknown) => {
+      return (err as { code: string }).code === EngineErrorCode.WRONG_PHASE;
+    });
+  });
+
+  it("nominate is rejected during DAY_DEFENSE / DAY_VOTING", () => {
+    const engine = inDay1Speeches();
+    // Drive through all speeches → DAY_DEFENSE.
+    const order = engine.getSpeakingOrder();
+    for (let i = 0; i < order.length; i++) {
+      engine.nextSpeaker();
+    }
+    assert.strictEqual(engine.state.phase, GamePhase.DAY_DEFENSE);
+    assert.throws(() => engine.nominate("p0", "p6"), (err: unknown) => {
+      return (err as { code: string }).code === EngineErrorCode.WRONG_PHASE;
+    });
+  });
+});
+
+describe("Engine — DAY_DEFENSE flow", () => {
+  function inDay1Defense(): Engine {
+    const state = freshState(10);
+    const engine = new Engine(state);
+    engine.startGame();
+    engine._assignRoleForTest("p3", Role.DOCTOR);
+    engine.mafiaKill("host", "p4");
+    // Doctor saves p4 so all 10 players remain alive for the day-cycle
+    // (speaking order, voting) — these tests need every seat available.
+    engine.doctorHeal("p3", "p4");
+    engine.resolveNight();
+    engine.startSpeeches();
+    engine.nominate("p0", "p6");
+    engine.nominate("p1", "p8");
+    const order = engine.getSpeakingOrder();
+    for (let i = 0; i < order.length; i++) {
+      engine.nextSpeaker();
+    }
+    // Engine should have auto-transitioned to DAY_DEFENSE.
+    return engine;
+  }
+
+  it("defense order is the nominated players in speaking order", () => {
+    const engine = inDay1Defense();
+    assert.strictEqual(engine.state.phase, GamePhase.DAY_DEFENSE);
+    // p6 < p8 in seatIndex order (both are alive, both nominated).
+    assert.deepStrictEqual(engine.getDefenseOrder(), ["p6", "p8"]);
+  });
+
+  it("nextDefense advances and auto-transitions to DAY_VOTING when done", () => {
+    const engine = inDay1Defense();
+    assert.strictEqual(engine.getCurrentDefense(), "p6");
+    engine.nextDefense();
+    assert.strictEqual(engine.getCurrentDefense(), "p8");
+    engine.nextDefense();
+    assert.strictEqual(engine.getCurrentDefense(), "");
+    assert.strictEqual(engine.state.phase, GamePhase.DAY_VOTING);
+  });
+
+  it("nextDefense is rejected outside DAY_DEFENSE", () => {
+    const state = freshState(10);
+    const engine = new Engine(state);
+    engine.startGame();
+    assert.throws(() => engine.nextDefense(), (err: unknown) => {
+      return (err as { code: string }).code === EngineErrorCode.WRONG_PHASE;
+    });
+  });
+
+  it("DAY_DEFENSE with no nominations auto-transitions to DAY_VOTING on first nextDefense call", () => {
+    const state = freshState(10);
+    const engine = new Engine(state);
+    engine.startGame();
+    engine._assignRoleForTest("p3", Role.DOCTOR);
+    engine.mafiaKill("host", "p4");
+    engine.doctorHeal("p3", "p5");
+    engine.resolveNight();
+    engine.startSpeeches();
+    const order = engine.getSpeakingOrder();
+    for (let i = 0; i < order.length; i++) {
+      engine.nextSpeaker();
+    }
+    assert.strictEqual(engine.state.phase, GamePhase.DAY_DEFENSE);
+    engine.nextDefense();
+    assert.strictEqual(engine.state.phase, GamePhase.DAY_VOTING);
+    assert.deepStrictEqual(engine.getDefenseOrder(), []);
+  });
+});
+
+describe("Engine — voting", () => {
+  function inDay1Voting(): Engine {
+    const state = freshState(10);
+    const engine = new Engine(state);
+    engine.startGame();
+    engine._assignRoleForTest("p3", Role.DOCTOR);
+    engine.mafiaKill("host", "p4");
+    // Doctor saves p4 so all 10 players remain alive for the day-cycle
+    // (speaking order, voting) — these tests need every seat available.
+    engine.doctorHeal("p3", "p4");
+    engine.resolveNight();
+    engine.startSpeeches();
+    engine.nominate("p0", "p6");
+    engine.nominate("p1", "p8");
+    const order = engine.getSpeakingOrder();
+    for (let i = 0; i < order.length; i++) {
+      engine.nextSpeaker();
+    }
+    const dOrder = engine.getDefenseOrder();
+    for (let i = 0; i < dOrder.length; i++) {
+      engine.nextDefense();
+    }
+    return engine;
+  }
+
+  it("vote records the voter's choice for a nominated candidate", () => {
+    const engine = inDay1Voting();
+    engine.vote("p0", "p6");
+    engine.vote("p1", "p8");
+    engine.vote("p2", "p6");
+    assert.strictEqual(engine.getVote("p0"), "p6");
+    assert.strictEqual(engine.getVote("p1"), "p8");
+    assert.strictEqual(engine.getVote("p2"), "p6");
+    assert.strictEqual(engine.getVote("p3"), "");
+  });
+
+  it("vote rejects a target that is not nominated", () => {
+    const engine = inDay1Voting();
+    assert.throws(() => engine.vote("p0", "p7"), (err: unknown) => {
+      return (err as { code: string }).code === EngineErrorCode.WRONG_ROLE;
+    });
+  });
+
+  it("vote rejects a dead voter", () => {
+    const engine = inDay1Voting();
+    engine.state.players.get("p0")!.isAlive = false;
+    assert.throws(() => engine.vote("p0", "p6"), (err: unknown) => {
+      return (err as { code: string }).code === EngineErrorCode.PLAYER_DEAD;
+    });
+  });
+
+  it("vote rejects a dead target", () => {
+    const engine = inDay1Voting();
+    engine.state.players.get("p6")!.isAlive = false;
+    assert.throws(() => engine.vote("p0", "p6"), (err: unknown) => {
+      return (err as { code: string }).code === EngineErrorCode.PLAYER_DEAD;
+    });
+  });
+
+  it("vote is rejected outside DAY_VOTING", () => {
+    const state = freshState(10);
+    const engine = new Engine(state);
+    engine.startGame();
+    assert.throws(() => engine.vote("p0", "p4"), (err: unknown) => {
+      return (err as { code: string }).code === EngineErrorCode.WRONG_PHASE;
+    });
+  });
+
+  it("a voter can re-vote; only the latest choice counts", () => {
+    const engine = inDay1Voting();
+    engine.vote("p0", "p6");
+    engine.vote("p0", "p8");
+    assert.strictEqual(engine.getVote("p0"), "p8");
+  });
+});
+
+describe("Engine — resolveVoting", () => {
+  function inDay1Voting(): Engine {
+    const state = freshState(10);
+    const engine = new Engine(state);
+    engine.startGame();
+    engine._assignRoleForTest("p3", Role.DOCTOR);
+    engine.mafiaKill("host", "p4");
+    // Doctor saves p4 so all 10 players remain alive for the day-cycle
+    // (speaking order, voting) — these tests need every seat available.
+    engine.doctorHeal("p3", "p4");
+    engine.resolveNight();
+    engine.startSpeeches();
+    engine.nominate("p0", "p6");
+    engine.nominate("p1", "p8");
+    const order = engine.getSpeakingOrder();
+    for (let i = 0; i < order.length; i++) {
+      engine.nextSpeaker();
+    }
+    const dOrder = engine.getDefenseOrder();
+    for (let i = 0; i < dOrder.length; i++) {
+      engine.nextDefense();
+    }
+    return engine;
+  }
+
+  it("highest-voted candidate is eliminated and marked dead", () => {
+    const engine = inDay1Voting();
+    // 6 votes for p6, 4 for p8.
+    for (let i = 0; i < 6; i++) engine.vote(`p${i}`, "p6");
+    for (let i = 6; i < 10; i++) engine.vote(`p${i}`, "p8");
+
+    const res = engine.resolveVoting();
+    assert.strictEqual(res.eliminatedId, "p6");
+    assert.strictEqual(res.voteCounts.p6, 6);
+    assert.strictEqual(res.voteCounts.p8, 4);
+    assert.strictEqual(res.totalVotes, 10);
+
+    assert.strictEqual(engine.state.players.get("p6")!.isAlive, false);
+    assert.strictEqual(engine.state.players.get("p8")!.isAlive, true);
+  });
+
+  it("default vote: non-voters are assigned to the last speaker", () => {
+    const engine = inDay1Voting();
+    // Speaking order is p0, p1, ..., p9 — last speaker is p9.
+    // Only p0 and p1 vote (for p6). The remaining 8 players default to p9.
+    engine.vote("p0", "p6");
+    engine.vote("p1", "p6");
+
+    const res = engine.resolveVoting();
+    assert.strictEqual(res.eliminatedId, "p9", "last speaker p9 wins by default");
+    // p9 receives 8 default votes; p6 receives 2 explicit votes.
+    assert.strictEqual(res.voteCounts.p9, 8);
+    assert.strictEqual(res.voteCounts.p6, 2);
+  });
+
+  it("resolveVoting transitions engine to NIGHT (dayCount unchanged)", () => {
+    const engine = inDay1Voting();
+    for (let i = 0; i < 10; i++) engine.vote(`p${i}`, "p6");
+    engine.resolveVoting();
+    assert.strictEqual(engine.state.phase, GamePhase.NIGHT);
+    assert.strictEqual(engine.state.nightStep, NightStep.MAFIA);
+    // dayCount is unchanged — it represents "current day". After voting, we
+    // transition to the next night; the next resolveNight will bump dayCount
+    // to 2 when Day 2 starts.
+    assert.strictEqual(engine.state.dayCount, 1);
+  });
+
+  it("onPlayerDied fires with the eliminated sessionId and VOTE_ELIMINATION cause", () => {
+    const engine = inDay1Voting();
+    let deadId = "";
+    let cause: DeathCause | "" = "";
+    engine.setOnPlayerDied((sessionId, c) => {
+      deadId = sessionId;
+      cause = c;
+    });
+
+    for (let i = 0; i < 10; i++) engine.vote(`p${i}`, "p8");
+    engine.resolveVoting();
+
+    assert.strictEqual(deadId, "p8");
+    assert.strictEqual(cause, "VOTE_ELIMINATION");
+  });
+
+  it("onPlayerDied does not fire when there are no nominations", () => {
+    const state = freshState(10);
+    const engine = new Engine(state);
+    engine.startGame();
+    engine._assignRoleForTest("p3", Role.DOCTOR);
+    engine.mafiaKill("host", "p4");
+    engine.doctorHeal("p3", "p5");
+    engine.resolveNight();
+    engine.startSpeeches();
+    const order = engine.getSpeakingOrder();
+    for (let i = 0; i < order.length; i++) {
+      engine.nextSpeaker();
+    }
+    engine.nextDefense(); // → DAY_VOTING
+
+    let fired = false;
+    engine.setOnPlayerDied(() => {
+      fired = true;
+    });
+
+    const res = engine.resolveVoting();
+    assert.strictEqual(res.eliminatedId, "");
+    assert.strictEqual(fired, false, "no callback when no one was eliminated");
+    // Engine still transitions to NIGHT so the cycle can continue.
+    assert.strictEqual(engine.state.phase, GamePhase.NIGHT);
+  });
+
+  it("Player.votes is written to the public schema after resolveVoting", () => {
+    const engine = inDay1Voting();
+    for (let i = 0; i < 7; i++) engine.vote(`p${i}`, "p6");
+    for (let i = 7; i < 10; i++) engine.vote(`p${i}`, "p8");
+    engine.resolveVoting();
+    assert.strictEqual(engine.state.players.get("p6")!.votes, 7);
+    assert.strictEqual(engine.state.players.get("p8")!.votes, 3);
+  });
+
+  it("resolveVoting clears the engine's per-vote buffer so a new round starts fresh", () => {
+    const engine = inDay1Voting();
+    for (let i = 0; i < 10; i++) engine.vote(`p${i}`, "p6");
+    engine.resolveVoting();
+    // After resolution the vote buffer is empty. A new vote would only succeed
+    // when DAY_VOTING is reached again — but the engine is now in NIGHT, so
+    // it's a phase error.
+    assert.throws(() => engine.vote("p0", "p8"), (err: unknown) => {
+      return (err as { code: string }).code === EngineErrorCode.WRONG_PHASE;
+    });
+  });
+
+  it("resolveVoting is rejected outside DAY_VOTING", () => {
+    const state = freshState(10);
+    const engine = new Engine(state);
+    engine.startGame();
+    assert.throws(() => engine.resolveVoting(), (err: unknown) => {
+      return (err as { code: string }).code === EngineErrorCode.WRONG_PHASE;
+    });
   });
 });

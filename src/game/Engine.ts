@@ -3,6 +3,7 @@ import { GamePhase, NightStep, Role, Team } from "../rooms/schema/enums.js";
 import {
   ActionLogEntry,
   ActionType,
+  DeathCause,
   EngineError,
   EngineErrorCode,
   NightResolution,
@@ -10,6 +11,7 @@ import {
   PlayerIdentity,
   ROLE_DISTRIBUTION,
   SUPPORTED_PLAYER_COUNTS,
+  VoteResolution,
 } from "./types.js";
 
 /**
@@ -50,6 +52,13 @@ function shuffle<T>(items: readonly T[]): T[] {
  *  - mafiaKill / donCheck / sheriffCheck / doctorHeal validate phase + role
  *  - doctorHeal hard-rejects the Doctor's previous night's target
  *  - resolveNight compares mafia victim vs doctor heal and writes state.died
+ *
+ * Slice-3 (ticket 03) adds the Day-1 basic flow:
+ *  - resolveNight transitions NIGHT → DAY_ANNOUNCEMENT and bumps dayCount
+ *  - nominate / vote / resolveVoting walk the day cycle through speeches,
+ *    defense, and voting (skipping BALAGAN for Day 1 per ADR 0005)
+ *  - resolveVoting tallies with default vote = last speaker, marks the loser
+ *    dead, fires the onPlayerDied seam, and transitions DAY_VOTING → NIGHT
  *
  * The engine never touches the network; the room translates `EngineError`
  * into player-visible messages and `client.send` for private role reveals.
@@ -96,6 +105,45 @@ export class Engine {
     doctorHeal: null,
   };
 
+  /**
+   * Day-cycle speaking order — alive non-host players in seat order. Recomputed
+   * each day at `startSpeeches`; players who die during the day stay in this
+   * list (defensive — they should not be on it because we recompute at start).
+   */
+  private speakingOrder: string[] = [];
+
+  /**
+   * Pointer into `speakingOrder`. `-1` while no speech has started yet;
+   * `speakingOrder.length` when all speeches are done (auto-transition to
+   * DAY_DEFENSE).
+   */
+  private currentSpeakerIndex = -1;
+
+  /**
+   * Day-cycle defense order — nominated players in seat order. Empty when no
+   * one was nominated. Recomputed when entering DAY_DEFENSE.
+   */
+  private defenseOrder: string[] = [];
+
+  /**
+   * Pointer into `defenseOrder`. Same semantics as `currentSpeakerIndex`.
+   */
+  private currentDefenseIndex = -1;
+
+  /**
+   * Per-day vote buffer: voter → target. Cleared at the start of each day and
+   * after `resolveVoting`.
+   */
+  private votes = new Map<string, string>();
+
+  /**
+   * Optional seam fired whenever a player dies. Day-cycle elimination calls it
+   * with `VOTE_ELIMINATION`; night mafia kills call `MAFIA_KILL`; follow-up
+   * tickets (05) add `DECLARED_DEAD` for host-declared dead on disconnect.
+   * The room uses this hook to run victory checks and host notifications.
+   */
+  private onPlayerDied: ((sessionId: string, cause: DeathCause) => void) | null = null;
+
   private nextEntryId = 0;
 
   constructor(public readonly state: MafiaState) {}
@@ -138,6 +186,47 @@ export class Engine {
   /** Returns the Doctor's last healed target (or empty string if none). */
   getLastHealed(doctorSessionId: string): string {
     return this.lastHealed.get(doctorSessionId) ?? "";
+  }
+
+  /**
+   * Day cycle: the sessionId of the player currently giving their speech, or
+   * empty string when the phase isn't DAY_SPEECHES or all speeches are done.
+   */
+  getCurrentSpeaker(): string {
+    if (this.state.phase !== GamePhase.DAY_SPEECHES) return "";
+    if (this.currentSpeakerIndex < 0) return "";
+    if (this.currentSpeakerIndex >= this.speakingOrder.length) return "";
+    return this.speakingOrder[this.currentSpeakerIndex];
+  }
+
+  /**
+   * Day cycle: the sessionId of the candidate currently defending, or empty
+   * string when the phase isn't DAY_DEFENSE or all defenses are done.
+   */
+  getCurrentDefense(): string {
+    if (this.state.phase !== GamePhase.DAY_DEFENSE) return "";
+    if (this.currentDefenseIndex < 0) return "";
+    if (this.currentDefenseIndex >= this.defenseOrder.length) return "";
+    return this.defenseOrder[this.currentDefenseIndex];
+  }
+
+  /** Day cycle: alive non-host players in seat order (frozen at startSpeeches). */
+  getSpeakingOrder(): string[] {
+    return [...this.speakingOrder];
+  }
+
+  /** Day cycle: nominated players in seat order (frozen at DAY_DEFENSE entry). */
+  getDefenseOrder(): string[] {
+    return [...this.defenseOrder];
+  }
+
+  /**
+   * Day cycle: the target a voter cast for. Returns empty string if the player
+   * has not voted (and a default vote has not been applied yet — defaults are
+   * applied only inside `resolveVoting`).
+   */
+  getVote(voterSessionId: string): string {
+    return this.votes.get(voterSessionId) ?? "";
   }
 
   /**
@@ -306,8 +395,15 @@ export class Engine {
 
   /**
    * Compare mafia victim vs doctor heal and write `state.died`. Clears the
-   * night action buffer and stores the Doctor's last-healed target for the
-   * next night.
+   * night action buffer, stores the Doctor's last-healed target for the next
+   * night, marks the victim dead, fires the `onPlayerDied` seam with cause
+   * `MAFIA_KILL`, and transitions NIGHT → DAY_ANNOUNCEMENT. Bumps
+   * `dayCount` so the public schema reflects "we are now on Day N" once
+   * the day starts.
+   *
+   * Day 1 starts with `dayCount = 1`; Day 2 starts with `dayCount = 2`. The
+   * increment happens here so `state.died` and `state.dayCount` are mutually
+   * consistent on DAY_ANNOUNCEMENT entry.
    *
    * Returns the resolution so tests can assert without reading mutable state.
    */
@@ -339,6 +435,266 @@ export class Engine {
     });
 
     this.resetNightActions();
+
+    // Mark the victim dead in the public schema and fire the seam. Doing
+    // this here (not at DAY_ANNOUNCEMENT entry) keeps the seam as a single
+    // observation point for every death cause — vote elimination in
+    // `resolveVoting`, host-declared dead in the upcoming ticket 05.
+    if (died !== "") {
+      const target = this.state.players.get(died);
+      if (target) target.isAlive = false;
+      this.onPlayerDied?.(died, "MAFIA_KILL");
+    }
+
+    // Day-cycle entry: bump dayCount, reset day state, transition phase.
+    this.state.dayCount = this.state.dayCount + 1;
+    this.resetDayState();
+    this.state.phase = GamePhase.DAY_ANNOUNCEMENT;
+
+    return resolution;
+  }
+
+  // ─── Day cycle ──────────────────────────────────────────────────────────
+
+  /**
+   * Register a callback fired whenever a player dies. The room subscribes to
+   * observe elimination so it can run victory checks and host notifications.
+   * Pass `null` to unsubscribe. A single callback overwrites any previous one.
+   */
+  setOnPlayerDied(callback: ((sessionId: string, cause: DeathCause) => void) | null): void {
+    this.onPlayerDied = callback;
+  }
+
+  /**
+   * Add `targetId` to the day's nomination list. Valid during DAY_SPEECHES
+   * (Day 1) and during DAY_BALAGAN (Day 2+ — out of scope here, but the phase
+   * guard matches the future ticket 07).
+   *
+   * The actor must be alive; the target must be alive and not already
+   * nominated. Players self-nominating is allowed (a player may volunteer for
+   * the chop).
+   */
+  nominate(actorSessionId: string, targetId: string): void {
+    // Day 1 has only DAY_SPEECHES; Day 2+ uses DAY_SPEECHES or DAY_BALAGAN.
+    if (
+      this.state.phase !== GamePhase.DAY_SPEECHES &&
+      this.state.phase !== GamePhase.DAY_BALAGAN
+    ) {
+      throw new EngineError(
+        EngineErrorCode.WRONG_PHASE,
+        `nominate requires phase DAY_SPEECHES or DAY_BALAGAN, currently ${this.state.phase}`,
+      );
+    }
+    this.requireAlivePlayer(actorSessionId);
+    this.requireAlivePlayer(targetId);
+    if (this.state.nominations.includes(targetId)) {
+      throw new EngineError(
+        EngineErrorCode.WRONG_ROLE,
+        `Player ${targetId} is already nominated`,
+      );
+    }
+
+    this.state.nominations.push(targetId);
+    const target = this.state.players.get(targetId)!;
+    target.isNominated = true;
+
+    this.logEntry({
+      actorSessionId,
+      type: ActionType.NOMINATE,
+      payload: { targetId },
+    });
+  }
+
+  /**
+   * Transition DAY_ANNOUNCEMENT → DAY_SPEECHES. Computes the speaking order
+   * (alive non-host players in seat order), points at the first speaker, and
+   * writes `state.currentSpeakerId` so clients can render the speaker badge.
+   */
+  startSpeeches(): void {
+    this.requirePhase(GamePhase.DAY_ANNOUNCEMENT);
+
+    this.speakingOrder = this.computeSpeakingOrder();
+    this.currentSpeakerIndex = this.speakingOrder.length === 0 ? -1 : 0;
+    this.state.phase = GamePhase.DAY_SPEECHES;
+    this.state.currentSpeakerId = this.getCurrentSpeaker();
+    this.state.currentDefenseId = "";
+
+    this.logEntry({
+      actorSessionId: "",
+      type: ActionType.PHASE_ADVANCE,
+      payload: { event: "speeches_started", speakerCount: this.speakingOrder.length },
+    });
+  }
+
+  /**
+   * Advance to the next speaker in the clockwise order. When all speakers are
+   * done, auto-transition to DAY_DEFENSE (skipping DAY_BALAGAN on Day 1 per
+   * ADR 0005 — Day 2+ ticket 07 will revisit the BALAGAN insertion).
+   */
+  nextSpeaker(): void {
+    this.requirePhase(GamePhase.DAY_SPEECHES);
+
+    this.currentSpeakerIndex += 1;
+    if (this.currentSpeakerIndex >= this.speakingOrder.length) {
+      this.enterDayDefense();
+      return;
+    }
+    this.state.currentSpeakerId = this.getCurrentSpeaker();
+  }
+
+  /**
+   * Advance to the next nominated candidate's defense. When all defenders
+   * are done, auto-transition to DAY_VOTING. Calling nextDefense on an empty
+   * defense order immediately transitions (so a day with zero nominations
+   * ends without a defense round).
+   */
+  nextDefense(): void {
+    this.requirePhase(GamePhase.DAY_DEFENSE);
+
+    this.currentDefenseIndex += 1;
+    if (this.currentDefenseIndex >= this.defenseOrder.length) {
+      this.enterDayVoting();
+      return;
+    }
+    this.state.currentDefenseId = this.getCurrentDefense();
+  }
+
+  /**
+   * Record `actorSessionId`'s vote for `targetId`. Valid only during
+   * DAY_VOTING; the target must already be nominated. Players can re-vote
+   * before the round closes; only the latest choice counts.
+   */
+  vote(actorSessionId: string, targetId: string): void {
+    this.requirePhase(GamePhase.DAY_VOTING);
+    this.requireAlivePlayer(actorSessionId);
+    this.requireAlivePlayer(targetId);
+    if (!this.state.nominations.includes(targetId)) {
+      throw new EngineError(
+        EngineErrorCode.WRONG_ROLE,
+        `Player ${targetId} is not nominated and cannot be voted for`,
+      );
+    }
+
+    this.votes.set(actorSessionId, targetId);
+    this.logEntry({
+      actorSessionId,
+      type: ActionType.VOTE,
+      payload: { targetId },
+    });
+  }
+
+  /**
+   * Tally the day's votes and eliminate the highest-voted candidate (single-
+   * winner rule for Day 1; tie-breaking follows first-nominated-wins). Any
+   * alive player who did not submit a vote gets a default vote cast for the
+   * last speaker (per ADR 0003). Marks the loser dead, writes per-candidate
+   * totals to `Player.votes`, fires the `onPlayerDied` seam, and transitions
+   * DAY_VOTING → NIGHT.
+   *
+   * The candidate list for tally purposes is the explicit nominations plus
+   * the last speaker — the last speaker implicitly receives default votes
+   * from non-voters and is therefore eligible to win even if they did not
+   * formally nominate themselves.
+   *
+   * Returns the resolution for tests and action-log payloads. If no one was
+   * nominated and there is no last speaker (e.g., all players dead), no one
+   * is eliminated and the callback is not fired.
+   */
+  resolveVoting(): VoteResolution {
+    this.requirePhase(GamePhase.DAY_VOTING);
+
+    // Build a complete roster of voters: every alive non-host player gets a
+    // vote recorded. Non-voters are auto-assigned to the last speaker.
+    const lastSpeaker = this.speakingOrder[this.speakingOrder.length - 1] ?? "";
+    const voters: string[] = [];
+    for (const p of this.state.players.values()) {
+      if (p.isHost || !p.isAlive) continue;
+      voters.push(p.sessionId);
+    }
+
+    // Apply explicit votes + default votes into a normalized voter → target map.
+    const effective = new Map<string, string>();
+    for (const voter of voters) {
+      const explicit = this.votes.get(voter);
+      effective.set(voter, explicit ?? lastSpeaker);
+    }
+
+    // The candidate list is the explicit nominations plus the last speaker
+    // (who implicitly receives default votes from non-voters).
+    const candidates: string[] = [...this.state.nominations];
+    if (lastSpeaker !== "" && !candidates.includes(lastSpeaker)) {
+      candidates.push(lastSpeaker);
+    }
+
+    // Tally per candidate.
+    const counts: Record<string, number> = {};
+    for (const candidate of candidates) {
+      counts[candidate] = 0;
+    }
+    for (const target of effective.values()) {
+      if (target === "") continue;
+      counts[target] = (counts[target] ?? 0) + 1;
+    }
+
+    // Pick the single highest-voted candidate. Deterministic tie-break:
+    // first candidate in candidate-list order (i.e. nomination order, with
+    // the implicit last speaker appended last). 3-way revote logic lives in
+    // the follow-up ticket 08.
+    //
+    // If no one was explicitly nominated, no one is eliminated — the last
+    // speaker is added to the candidate list only so default votes have a
+    // landing target, but they do not "win" when they were never on the
+    // actual ballot.
+    let eliminatedId = "";
+    let best = -1;
+    if (this.state.nominations.length > 0) {
+      for (const candidate of candidates) {
+        const c = counts[candidate] ?? 0;
+        if (c > best) {
+          best = c;
+          eliminatedId = candidate;
+        }
+      }
+    }
+
+    // Write per-candidate totals to the public schema. The tallies persist
+    // on Player.votes until the next DAY_ANNOUNCEMENT (cleared in
+    // resetDayState), so clients can read the day's final results during
+    // the post-resolution NIGHT.
+    for (const candidate of candidates) {
+      const player = this.state.players.get(candidate);
+      if (player) player.votes = counts[candidate] ?? 0;
+    }
+
+    const resolution: VoteResolution = {
+      eliminatedId,
+      voteCounts: counts,
+      totalVotes: voters.length,
+    };
+
+    this.logEntry({
+      actorSessionId: "",
+      type: ActionType.PHASE_ADVANCE,
+      payload: { event: "voting_resolved", ...resolution },
+    });
+
+    // Mark the loser dead and fire the seam. The seam is intentionally the
+    // only place that knows about the death — the room uses it to run victory
+    // checks and host notifications.
+    if (eliminatedId !== "") {
+      const target = this.state.players.get(eliminatedId);
+      if (target) target.isAlive = false;
+      this.onPlayerDied?.(eliminatedId, "VOTE_ELIMINATION");
+    }
+
+    // Clear transient day-cycle engine state, but preserve Player.votes (see
+    // comment above) so the final tally is visible during the post-vote NIGHT.
+    // Votes are cleared on the next DAY_ANNOUNCEMENT via resetDayState.
+    this.resetDayState({ preserveTallies: true });
+
+    this.state.phase = GamePhase.NIGHT;
+    this.state.nightStep = NightStep.MAFIA;
+
     return resolution;
   }
 
@@ -472,6 +828,87 @@ export class Engine {
     };
     this.state.mafiaTargetId = "";
     this.state.doctorTargetId = "";
+  }
+
+  /**
+   * Build the day's speaking order: alive non-host players sorted by seatIndex
+   * (clockwise). The host never speaks. Dead players are skipped — a player
+   * who dies during the night is removed from the speech roster before
+   * DAY_SPEECHES starts.
+   */
+  private computeSpeakingOrder(): string[] {
+    const players = [...this.state.players.values()]
+      .filter((p) => !p.isHost && p.isAlive)
+      .sort((a, b) => a.seatIndex - b.seatIndex);
+    return players.map((p) => p.sessionId);
+  }
+
+  /**
+   * Build the day's defense order: nominated players (those in
+   * `state.nominations`) sorted by seatIndex, so the defense follows the same
+   * clockwise direction as the speeches.
+   */
+  private computeDefenseOrder(): string[] {
+    return [...this.state.nominations]
+      .map((id) => this.state.players.get(id))
+      .filter((p): p is NonNullable<typeof p> => p !== undefined && p.isAlive)
+      .sort((a, b) => a.seatIndex - b.seatIndex)
+      .map((p) => p.sessionId);
+  }
+
+  /**
+   * Enter DAY_DEFENSE from DAY_SPEECHES. Computes the defense order from the
+   * nominations and points at the first defender. If no one was nominated,
+   * the engine enters DAY_DEFENSE with an empty defense order; the first
+   * nextDefense() call will immediately move to DAY_VOTING.
+   */
+  private enterDayDefense(): void {
+    this.defenseOrder = this.computeDefenseOrder();
+    this.currentDefenseIndex = this.defenseOrder.length === 0 ? -1 : 0;
+    this.state.phase = GamePhase.DAY_DEFENSE;
+    this.state.currentSpeakerId = "";
+    this.state.currentDefenseId = this.getCurrentDefense();
+    this.logEntry({
+      actorSessionId: "",
+      type: ActionType.PHASE_ADVANCE,
+      payload: { event: "defense_started", defenseCount: this.defenseOrder.length },
+    });
+  }
+
+  /**
+   * Enter DAY_VOTING from DAY_DEFENSE. Resets the vote buffer to prepare for
+   * a fresh round; clients see DAY_VOTING and may now submit votes.
+   */
+  private enterDayVoting(): void {
+    this.votes.clear();
+    this.state.phase = GamePhase.DAY_VOTING;
+    this.state.currentDefenseId = "";
+    this.logEntry({
+      actorSessionId: "",
+      type: ActionType.PHASE_ADVANCE,
+      payload: { event: "voting_started", nominations: this.state.nominations.length },
+    });
+  }
+
+  /**
+   * Reset day-cycle state. Called from two places:
+   *  - `resolveNight` (new day starts) — clears Player.votes too.
+   *  - `resolveVoting` (day just ended) — preserves Player.votes so clients
+   *    can read the final tally during the post-resolution NIGHT.
+   */
+  private resetDayState({ preserveTallies }: { preserveTallies: boolean } = { preserveTallies: false }): void {
+    for (const p of this.state.players.values()) {
+      p.isNominated = false;
+      if (!preserveTallies) p.votes = 0;
+    }
+    this.state.nominations.splice(0, this.state.nominations.length);
+    this.state.currentSpeakerId = "";
+    this.state.currentDefenseId = "";
+    this.speakingOrder = [];
+    this.currentSpeakerIndex = -1;
+    this.defenseOrder = [];
+    this.currentDefenseIndex = -1;
+    this.votes.clear();
   }
 
   private logEntry(entry: Omit<ActionLogEntry, "id" | "timestamp" | "phase" | "dayCount" | "nightStep">): void {

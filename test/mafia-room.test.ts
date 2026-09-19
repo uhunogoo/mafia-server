@@ -5,7 +5,7 @@ import type { Room as SDKRoom } from "@colyseus/sdk";
 import appConfig from "../src/app.config.js";
 import { MafiaState } from "../src/rooms/schema/MafiaState.js";
 import { MafiaRoom } from "../src/rooms/MafiaRoom.js";
-import { Role, GamePhase } from "../src/rooms/schema/enums.js";
+import { Role, GamePhase, NightStep } from "../src/rooms/schema/enums.js";
 
 interface Setup {
   room: MafiaRoom;
@@ -375,5 +375,216 @@ describe("mafia_room", () => {
 
     assert.strictEqual(received.length, 0, "non-host must never receive the log");
     assert.ok(errors.length > 0, "non-host should receive an error");
+  });
+
+  // ─── Ticket 03: Day-1 basic flow ──────────────────────────────────────
+
+  /**
+   * Drive the room through a full Day 1 cycle, starting from the post-
+   * startGame NIGHT state produced by `setupRoom`. Mirrors the engine
+   * helper but goes through the room's message layer. Nominations are
+   * submitted AFTER `startSpeeches` (the only phase in which they're valid);
+   * votes are submitted AFTER DAY_VOTING is reached.
+   */
+  async function driveDay1(
+    setup: Setup,
+    nominations: { nominator: SDKRoom<MafiaRoom, MafiaState>; target: string }[],
+    votes: { voter: SDKRoom<MafiaRoom, MafiaState>; target: string }[],
+  ): Promise<void> {
+    const { room, host, guests } = setup;
+
+    // Night actions: mafia kills p5, doctor heals p5 → no one dies.
+    host.send("mafiaKill", { targetId: guests[5].sessionId });
+    await room.waitForNextPatch();
+    guests[3].send("doctorHeal", { targetId: guests[5].sessionId });
+    await room.waitForNextPatch();
+    host.send("resolveNight");
+    await room.waitForNextPatch();
+
+    assert.strictEqual(room.state.phase, GamePhase.DAY_ANNOUNCEMENT);
+    assert.strictEqual(room.state.dayCount, 1);
+
+    // Speeches — start, nominate during the first few speakers, then drive
+    // through every speaker.
+    host.send("startSpeeches");
+    await room.waitForNextPatch();
+    assert.strictEqual(room.state.phase, GamePhase.DAY_SPEECHES);
+    const speakingOrder = room.engine.getSpeakingOrder();
+    assert.strictEqual(speakingOrder.length, 10);
+
+    // Nominations must happen while we're in DAY_SPEECHES. We send them
+    // immediately after startSpeeches so the speakingOrder loop has time to
+    // pick them up.
+    for (const n of nominations) {
+      n.nominator.send("nominate", { targetId: n.target });
+      await room.waitForNextPatch();
+    }
+
+    for (let i = 0; i < speakingOrder.length; i++) {
+      host.send("nextSpeaker");
+      await room.waitForNextPatch();
+    }
+    // After the last nextSpeaker the engine auto-transitions to DAY_DEFENSE.
+    assert.strictEqual(room.state.phase, GamePhase.DAY_DEFENSE);
+
+    // Drive through every defender.
+    const defenseOrder = room.engine.getDefenseOrder();
+    for (let i = 0; i < defenseOrder.length; i++) {
+      host.send("nextDefense");
+      await room.waitForNextPatch();
+    }
+    assert.strictEqual(room.state.phase, GamePhase.DAY_VOTING);
+
+    // Cast explicit votes.
+    for (const v of votes) {
+      v.voter.send("vote", { targetId: v.target });
+      await room.waitForNextPatch();
+    }
+    host.send("resolveVoting");
+    await room.waitForNextPatch();
+  }
+
+  it("a full Day 1 cycle ends with the correct player eliminated and the engine in NIGHT phase", async () => {
+    const setup = await setupRoom(colyseus, 10);
+
+    // Drive the day, casting 6 votes for p6 and 4 for p8.
+    await driveDay1(
+      setup,
+      [
+        { nominator: setup.guests[0], target: setup.guests[6].sessionId },
+        { nominator: setup.guests[1], target: setup.guests[8].sessionId },
+      ],
+      [
+        ...setup.guests.slice(0, 6).map((v) => ({ voter: v, target: setup.guests[6].sessionId })),
+        ...setup.guests.slice(6, 10).map((v) => ({ voter: v, target: setup.guests[8].sessionId })),
+      ],
+    );
+
+    assert.strictEqual(setup.room.state.phase, GamePhase.NIGHT);
+    assert.strictEqual(setup.room.state.nightStep, NightStep.MAFIA);
+    assert.strictEqual(setup.room.state.dayCount, 1);
+
+    // p6 was the highest-voted candidate and is now dead.
+    assert.strictEqual(setup.room.state.players.get(setup.guests[6].sessionId)!.isAlive, false);
+    assert.strictEqual(setup.room.state.players.get(setup.guests[8].sessionId)!.isAlive, true);
+
+    // Player.votes reflects the final tally (the engine writes it before
+    // clearing the per-player flags on the next DAY_ANNOUNCEMENT).
+    assert.strictEqual(setup.room.state.players.get(setup.guests[6].sessionId)!.votes, 6);
+    assert.strictEqual(setup.room.state.players.get(setup.guests[8].sessionId)!.votes, 4);
+  });
+
+  it("default vote: players who didn't vote are auto-cast to the last speaker", async () => {
+    const setup = await setupRoom(colyseus, 10);
+
+    // Nominate two players — neither of them is the last speaker (p9).
+    // Only p0 votes (for p5). The remaining 9 players default to p9, who is
+    // not on the candidate list — but per ADR 0003 the last speaker is
+    // implicitly a candidate and receives the default votes. With 9 default
+    // votes versus 1 explicit, p9 wins by default.
+    await driveDay1(
+      setup,
+      [
+        { nominator: setup.guests[0], target: setup.guests[5].sessionId },
+        { nominator: setup.guests[1], target: setup.guests[7].sessionId },
+      ],
+      [{ voter: setup.guests[0], target: setup.guests[5].sessionId }],
+    );
+
+    assert.strictEqual(setup.room.state.phase, GamePhase.NIGHT);
+    assert.strictEqual(
+      setup.room.state.players.get(setup.guests[9].sessionId)!.isAlive,
+      false,
+      "last speaker wins by default votes",
+    );
+    assert.strictEqual(setup.room.state.players.get(setup.guests[9].sessionId)!.votes, 9);
+    assert.strictEqual(setup.room.state.players.get(setup.guests[5].sessionId)!.votes, 1);
+  });
+
+  it("non-host cannot start speeches / nextSpeaker / nextDefense / resolveVoting", async () => {
+    const setup = await setupRoom(colyseus, 10);
+
+    const errors: string[] = [];
+    setup.guests[0].onMessage("error", (msg: unknown) => {
+      errors.push(String((msg as { message?: string }).message ?? msg));
+    });
+
+    setup.guests[0].send("startSpeeches");
+    await setup.room.waitForNextPatch();
+    setup.guests[0].send("nextSpeaker");
+    await setup.room.waitForNextPatch();
+    setup.guests[0].send("nextDefense");
+    await setup.room.waitForNextPatch();
+    setup.guests[0].send("resolveVoting");
+    await setup.room.waitForNextPatch();
+
+    assert.ok(errors.length >= 4, `non-host should receive errors for all four actions, got ${errors.length}`);
+  });
+
+  it("resolveNight from NIGHT transitions to DAY_ANNOUNCEMENT in the public schema", async () => {
+    const setup = await setupRoom(colyseus, 10);
+
+    setup.host.send("mafiaKill", { targetId: setup.guests[5].sessionId });
+    await setup.room.waitForNextPatch();
+    setup.host.send("resolveNight");
+    await setup.room.waitForNextPatch();
+
+    assert.strictEqual(setup.room.state.phase, GamePhase.DAY_ANNOUNCEMENT);
+    assert.strictEqual(setup.room.state.dayCount, 1);
+    assert.strictEqual(setup.room.state.died, setup.guests[5].sessionId);
+  });
+
+  it("nominate is rejected when the phase is not DAY_SPEECHES (e.g. NIGHT)", async () => {
+    const setup = await setupRoom(colyseus, 10);
+
+    const errors: string[] = [];
+    setup.guests[0].onMessage("error", (msg: unknown) => {
+      errors.push(String((msg as { message?: string }).message ?? msg));
+    });
+
+    setup.guests[0].send("nominate", { targetId: setup.guests[5].sessionId });
+    await setup.room.waitForNextPatch();
+
+    assert.ok(errors.length > 0, "nominate during NIGHT must error");
+    assert.strictEqual(setup.room.state.nominations.length, 0);
+  });
+
+  it("vote is rejected for a non-nominated candidate", async () => {
+    const setup = await setupRoom(colyseus, 10);
+
+    // Drive into DAY_VOTING with only p6 nominated.
+    setup.host.send("mafiaKill", { targetId: setup.guests[5].sessionId });
+    await setup.room.waitForNextPatch();
+    setup.guests[3].send("doctorHeal", { targetId: setup.guests[9].sessionId });
+    await setup.room.waitForNextPatch();
+    setup.host.send("resolveNight");
+    await setup.room.waitForNextPatch();
+    setup.host.send("startSpeeches");
+    await setup.room.waitForNextPatch();
+    setup.guests[0].send("nominate", { targetId: setup.guests[6].sessionId });
+    await setup.room.waitForNextPatch();
+
+    const order = setup.room.engine.getSpeakingOrder();
+    for (let i = 0; i < order.length; i++) {
+      setup.host.send("nextSpeaker");
+      await setup.room.waitForNextPatch();
+    }
+    const dOrder = setup.room.engine.getDefenseOrder();
+    for (let i = 0; i < dOrder.length; i++) {
+      setup.host.send("nextDefense");
+      await setup.room.waitForNextPatch();
+    }
+
+    assert.strictEqual(setup.room.state.phase, GamePhase.DAY_VOTING);
+
+    const errors: string[] = [];
+    setup.guests[0].onMessage("error", (msg: unknown) => {
+      errors.push(String((msg as { message?: string }).message ?? msg));
+    });
+
+    setup.guests[0].send("vote", { targetId: setup.guests[7].sessionId });
+    await setup.room.waitForNextPatch();
+
+    assert.ok(errors.length > 0, "vote for a non-nominated player must error");
   });
 });

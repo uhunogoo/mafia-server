@@ -21,9 +21,6 @@ export class MafiaRoom extends Room {
   private auth = new Auth(this);
 
   messages = {
-    vote: (_client: Client, _payload: { targetId: string }) => {
-      console.log("voting");
-    },
     startGame: (client: Client) => {
       if (!this.requireHost(client)) return;
 
@@ -107,6 +104,36 @@ export class MafiaRoom extends Room {
       if (!this.requireHost(client)) return;
       this.runEngine(() => this.engine.resolveNight(), client);
     },
+    startSpeeches: (client: Client) => {
+      if (!this.requireHost(client)) return;
+      this.runEngine(() => this.engine.startSpeeches(), client);
+    },
+    nextSpeaker: (client: Client) => {
+      if (!this.requireHost(client)) return;
+      this.runEngine(() => this.engine.nextSpeaker(), client);
+    },
+    nextDefense: (client: Client) => {
+      if (!this.requireHost(client)) return;
+      this.runEngine(() => this.engine.nextDefense(), client);
+    },
+    nominate: (client: Client, payload: { targetId: string }) => {
+      if (typeof payload?.targetId !== "string") {
+        this.fail(client, "targetId is required");
+        return;
+      }
+      this.runEngine(() => this.engine.nominate(client.sessionId, payload.targetId), client);
+    },
+    vote: (client: Client, payload: { targetId: string }) => {
+      if (typeof payload?.targetId !== "string") {
+        this.fail(client, "targetId is required");
+        return;
+      }
+      this.runEngine(() => this.engine.vote(client.sessionId, payload.targetId), client);
+    },
+    resolveVoting: (client: Client) => {
+      if (!this.requireHost(client)) return;
+      this.runEngine(() => this.engine.resolveVoting(), client);
+    },
     ping: (client: Client, payload: { toId: string }) => {
       if (typeof payload?.toId !== "string") {
         this.fail(client, "toId is required");
@@ -143,6 +170,13 @@ export class MafiaRoom extends Room {
       this.password = options.password;
       this.setMatchmaking({ unlisted: true });
     }
+
+    // Subscribe to the engine's death seam (ticket 03). Today the seam is a
+    // no-op; a follow-up ticket (09) wires it to the victory check so the
+    // engine can transition to GAME_OVER when one side is wiped out.
+    this.engine.setOnPlayerDied((_sessionId, _cause) => {
+      // Intentionally empty for this ticket.
+    });
   }
 
   async onAuth(client: Client, options: { name?: string }) {
