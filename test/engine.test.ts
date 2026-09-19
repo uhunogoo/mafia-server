@@ -361,9 +361,207 @@ describe("Engine вЂ” action log", () => {
     engine.resolveNight();
 
     const log = engine.getActionLog();
-    // startGame, mafiaKill, doctorHeal, resolveNight в†’ 4 entries
+    // startGame, mafiaKill, doctorHeal, resolveNight -> 4 entries
     assert.strictEqual(log.length, 4);
     assert.strictEqual(log[0].phase, GamePhase.NIGHT);
     assert.strictEqual(log[0].type, "PHASE_ADVANCE");
+  });
+});
+
+describe("Engine -- action log query", () => {
+  function seed(): Engine {
+    const state = freshState(10);
+    const engine = new Engine(state);
+    engine.startGame();
+    engine._assignRoleForTest("p3", Role.DOCTOR);
+    engine.mafiaKill("host", "p4");
+    engine.doctorHeal("p3", "p4");
+    engine.resolveNight();
+    return engine;
+  }
+
+  it("returns the whole log when since is empty", () => {
+    const engine = seed();
+    const entries = engine.getActionLogSince("");
+    assert.strictEqual(entries.length, engine.getActionLog().length);
+    assert.strictEqual(entries.length, 4);
+  });
+
+  it("returns entries strictly after the given id", () => {
+    const engine = seed();
+    const all = engine.getActionLog();
+    const sinceId = all[1].id; // skip startGame, return the rest
+    const tail = engine.getActionLogSince(sinceId);
+    assert.strictEqual(tail.length, all.length - 2);
+    assert.deepStrictEqual(
+      tail.map((e) => e.id),
+      all.slice(2).map((e) => e.id),
+    );
+  });
+
+  it("falls back to the whole log when the id is unknown", () => {
+    const engine = seed();
+    const tail = engine.getActionLogSince("act_does_not_exist");
+    assert.strictEqual(tail.length, engine.getActionLog().length);
+  });
+});
+
+describe("Engine -- pings", () => {
+  function setupDay(): { state: MafiaState; engine: Engine } {
+    const state = freshState(10);
+    const engine = new Engine(state);
+    engine.startGame();
+    // Simulate "we are now in DAY_SPEECHES" by flipping the phase directly.
+    engine.state.phase = GamePhase.DAY_SPEECHES;
+    return { state, engine };
+  }
+
+  function setupNight(): { state: MafiaState; engine: Engine } {
+    const state = freshState(10);
+    const engine = new Engine(state);
+    engine.startGame();
+    // Pin every role so the night-ping tests don't depend on the random
+    // shuffle. p0=DON, p1=MAFIA, p2-p9=CIVILIAN.
+    engine._assignRoleForTest("p0", Role.DON);
+    engine._assignRoleForTest("p1", Role.MAFIA);
+    for (let i = 2; i < 10; i++) {
+      engine._assignRoleForTest(`p${i}`, Role.CIVILIAN);
+    }
+    return { state, engine };
+  }
+
+  it("day phase: any alive player can ping any other alive player", () => {
+    const { engine } = setupDay();
+    const record = engine.ping("p0", "p4");
+    assert.strictEqual(record.fromId, "p0");
+    assert.strictEqual(record.toId, "p4");
+    assert.ok(record.id.startsWith("ping_"));
+    assert.ok(record.timestamp > 0);
+  });
+
+  it("day phase: a player cannot ping themselves", () => {
+    const { engine } = setupDay();
+    assert.throws(() => engine.ping("p0", "p0"), (err: unknown) => {
+      return (err as { code: string }).code === EngineErrorCode.WRONG_ROLE;
+    });
+  });
+
+  it("day phase: a dead player cannot ping or be pinged", () => {
+    const { state, engine } = setupDay();
+    state.players.get("p4")!.isAlive = false;
+
+    assert.throws(() => engine.ping("p0", "p4"), (err: unknown) => {
+      return (err as { code: string }).code === EngineErrorCode.PLAYER_DEAD;
+    });
+
+    state.players.get("p0")!.isAlive = false;
+    assert.throws(() => engine.ping("p0", "p5"), (err: unknown) => {
+      return (err as { code: string }).code === EngineErrorCode.PLAYER_DEAD;
+    });
+  });
+
+  it("day phase: pings are visible only to sender and recipient", () => {
+    const { engine } = setupDay();
+    engine.ping("p0", "p4");
+    engine.ping("p4", "p5");
+    engine.ping("p5", "p6");
+
+    const p0 = engine.getPingsForPlayer("p0");
+    const p4 = engine.getPingsForPlayer("p4");
+    const p5 = engine.getPingsForPlayer("p5");
+    const p6 = engine.getPingsForPlayer("p6");
+    const p7 = engine.getPingsForPlayer("p7");
+
+    assert.strictEqual(p0.length, 1, "p0 sent one ping");
+    assert.strictEqual(p0[0].toId, "p4");
+
+    assert.strictEqual(p4.length, 2, "p4 received p0's and sent one");
+    const p4Ids = p4.map((p) => `${p.fromId}->${p.toId}`).sort();
+    assert.deepStrictEqual(p4Ids, ["p0->p4", "p4->p5"]);
+
+    assert.strictEqual(p5.length, 2, "p5 received p4's and sent one");
+    const p5Ids = p5.map((p) => `${p.fromId}->${p.toId}`).sort();
+    assert.deepStrictEqual(p5Ids, ["p4->p5", "p5->p6"]);
+
+    assert.strictEqual(p6.length, 1, "p6 received one");
+    assert.strictEqual(p6[0].fromId, "p5");
+
+    assert.strictEqual(p7.length, 0, "p7 is not involved in any ping");
+
+    assert.strictEqual(engine.getAllPings().length, 3, "host sees everything");
+  });
+
+  it("day phase: each accepted ping is also a PING entry in the action log", () => {
+    const { engine } = setupDay();
+    const before = engine.getActionLog().length;
+    engine.ping("p0", "p4");
+    engine.ping("p4", "p5");
+
+    const log = engine.getActionLog();
+    assert.strictEqual(log.length, before + 2);
+    assert.strictEqual(log[log.length - 2].type, "PING");
+    assert.strictEqual(log[log.length - 2].actorSessionId, "p0");
+    assert.strictEqual((log[log.length - 2].payload as { toId: string }).toId, "p4");
+    assert.strictEqual(log[log.length - 1].type, "PING");
+    assert.strictEqual(log[log.length - 1].actorSessionId, "p4");
+  });
+
+  it("lobby: rejects pings", () => {
+    const state = freshState(10);
+    const engine = new Engine(state);
+    assert.throws(() => engine.ping("p0", "p4"), (err: unknown) => {
+      return (err as { code: string }).code === EngineErrorCode.WRONG_PHASE;
+    });
+  });
+
+  it("game over: rejects pings", () => {
+    const { engine } = setupDay();
+    engine.state.phase = GamePhase.GAME_OVER;
+    assert.throws(() => engine.ping("p0", "p4"), (err: unknown) => {
+      return (err as { code: string }).code === EngineErrorCode.WRONG_PHASE;
+    });
+  });
+
+  it("night: mafia (DON or MAFIA) can ping other mafia", () => {
+    const { engine } = setupNight();
+    // p0 = DON, p1 = MAFIA
+    const r1 = engine.ping("p0", "p1");
+    assert.strictEqual(r1.fromId, "p0");
+    assert.strictEqual(r1.toId, "p1");
+
+    const r2 = engine.ping("p1", "p0");
+    assert.strictEqual(r2.fromId, "p1");
+    assert.strictEqual(r2.toId, "p0");
+  });
+
+  it("night: a civilian cannot ping during the night", () => {
+    const { engine } = setupNight();
+    // p4 is unassigned -> still a civilian via the role distribution
+    assert.throws(() => engine.ping("p4", "p1"), (err: unknown) => {
+      return (err as { code: string }).code === EngineErrorCode.WRONG_ROLE;
+    });
+  });
+
+  it("night: mafia cannot ping a civilian", () => {
+    const { engine } = setupNight();
+    assert.throws(() => engine.ping("p1", "p4"), (err: unknown) => {
+      return (err as { code: string }).code === EngineErrorCode.WRONG_ROLE;
+    });
+  });
+
+  it("night: civilians don't see mafia pings via getPingsForPlayer", () => {
+    const { engine } = setupNight();
+    engine.ping("p0", "p1"); // mafia ping accepted
+    // p4 trying to ping p5 is rejected (civilian, also target is civilian);
+    // verify the rejection happens AND that the visibility list is empty.
+    assert.throws(() => engine.ping("p4", "p5"), (err: unknown) => {
+      return (err as { code: string }).code === EngineErrorCode.WRONG_ROLE;
+    });
+    assert.deepStrictEqual(engine.getPingsForPlayer("p4"), []);
+    // But the host sees the mafia ping.
+    const all = engine.getAllPings();
+    assert.strictEqual(all.length, 1);
+    assert.strictEqual(all[0].fromId, "p0");
+    assert.strictEqual(all[0].toId, "p1");
   });
 });

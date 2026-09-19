@@ -6,6 +6,7 @@ import {
   EngineError,
   EngineErrorCode,
   NightResolution,
+  PingRecord,
   PlayerIdentity,
   ROLE_DISTRIBUTION,
   SUPPORTED_PLAYER_COUNTS,
@@ -74,6 +75,13 @@ export class Engine {
   private lastHealed = new Map<string, string>();
 
   /**
+   * Every accepted ping for this game. Pings stay in the host's action log
+   * permanently; the room only forwards them to sender + recipient + host as
+   * live private messages (per ADR 0002 — "pings are ephemeral").
+   */
+  private pings: PingRecord[] = [];
+
+  /**
    * Per-night action buffer. Cleared on `resolveNight`.
    */
   private nightActions: {
@@ -109,9 +117,45 @@ export class Engine {
     return this.actionLog;
   }
 
+  /**
+   * Return every action-log entry strictly newer than `sinceEntryId`. The
+   * host uses this to incrementally fetch the log without resending the whole
+   * history on each poll. Pass `""` (empty string) to get the entire log.
+   * Unknown ids fall back to returning the whole log so a missed id never
+   * blocks the host from receiving entries.
+   */
+  getActionLogSince(sinceEntryId: string): ActionLogEntry[] {
+    if (sinceEntryId === "") {
+      return [...this.actionLog];
+    }
+    const idx = this.actionLog.findIndex((e) => e.id === sinceEntryId);
+    if (idx === -1) {
+      return [...this.actionLog];
+    }
+    return this.actionLog.slice(idx + 1);
+  }
+
   /** Returns the Doctor's last healed target (or empty string if none). */
   getLastHealed(doctorSessionId: string): string {
     return this.lastHealed.get(doctorSessionId) ?? "";
+  }
+
+  /**
+   * Pings visible to a specific player (sender or recipient). The room uses
+   * this when relaying pings to clients so a player only sees pings they were
+   * involved in (ADR 0002).
+   */
+  getPingsForPlayer(sessionId: string): PingRecord[] {
+    return this.pings.filter((p) => p.fromId === sessionId || p.toId === sessionId);
+  }
+
+  /**
+   * All pings accepted in this game, in insertion order. The host UI uses this
+   * to render a unified ping timeline; the per-player filtering is on top of
+   * the same data.
+   */
+  getAllPings(): PingRecord[] {
+    return [...this.pings];
   }
 
   // ─── Game flow ──────────────────────────────────────────────────────────
@@ -296,6 +340,74 @@ export class Engine {
 
     this.resetNightActions();
     return resolution;
+  }
+
+  /**
+   * Accept a ping from `fromId` to `toId`. The record is returned so the room
+   * can forward it to sender, recipient, and host as a private message; the
+   * engine also writes a `PING` entry to the host's action log.
+   *
+   * Visibility rules:
+   * - LOBBY / GAME_OVER: rejected (no signalling outside of an active game).
+   * - NIGHT: only mafia (DON or MAFIA) can send; the recipient must also be
+   *   mafia. Mafia coordination uses pings instead of text chat.
+   * - Any DAY_* phase: any alive player can ping any alive player.
+   * - Dead players can neither send nor receive pings (golden rule #1 —
+   *   "Dead don't speak").
+   *
+   * The engine never inspects network clients; the room is responsible for
+   * routing the returned record to the right three parties.
+   */
+  ping(fromId: string, toId: string): PingRecord {
+    if (
+      this.state.phase === GamePhase.LOBBY ||
+      this.state.phase === GamePhase.GAME_OVER
+    ) {
+      throw new EngineError(
+        EngineErrorCode.WRONG_PHASE,
+        `Pings are not allowed in phase ${this.state.phase}`,
+      );
+    }
+    if (fromId === toId) {
+      throw new EngineError(
+        EngineErrorCode.WRONG_ROLE,
+        "Cannot ping yourself",
+      );
+    }
+
+    this.requireAlivePlayer(fromId);
+    this.requireAlivePlayer(toId);
+
+    if (this.state.phase === GamePhase.NIGHT) {
+      const senderRole = this.getRole(fromId);
+      if (senderRole !== Role.MAFIA && senderRole !== Role.DON) {
+        throw new EngineError(
+          EngineErrorCode.WRONG_ROLE,
+          "Only mafia can ping during the night",
+        );
+      }
+      const targetRole = this.getRole(toId);
+      if (targetRole !== Role.MAFIA && targetRole !== Role.DON) {
+        throw new EngineError(
+          EngineErrorCode.WRONG_ROLE,
+          "Mafia can only ping other mafia during the night",
+        );
+      }
+    }
+
+    const record: PingRecord = {
+      id: `ping_${this.nextEntryId++}`,
+      fromId,
+      toId,
+      timestamp: Date.now(),
+    };
+    this.pings.push(record);
+    this.logEntry({
+      actorSessionId: fromId,
+      type: ActionType.PING,
+      payload: { id: record.id, toId },
+    });
+    return record;
   }
 
   // ─── Helpers ────────────────────────────────────────────────────────────

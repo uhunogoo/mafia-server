@@ -75,6 +75,22 @@ export interface NightResolution {
 }
 
 /**
+ * A single ping between two players. Pings are ephemeral signals — no message
+ * body — used for social coordination. The engine stores every ping it accepts
+ * so the host's action log can replay them, and the room uses the record to
+ * route the private `ping` message to sender, recipient, and host only.
+ *
+ * Per ADR 0002: players only see pings they sent or received; pings render
+ * for ~10s on the receiving client and disappear.
+ */
+export interface PingRecord {
+  id: string;
+  fromId: string;
+  toId: string;
+  timestamp: number;
+}
+
+/**
  * Errors thrown when the engine rejects an input. Each carries a code so the
  * room can translate to a player-visible message without leaking internals.
  */

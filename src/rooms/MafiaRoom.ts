@@ -2,7 +2,7 @@ import { Room, Client } from "@colyseus/core";
 import { MafiaState } from "./schema/MafiaState.js";
 import { Auth } from "../config/auth.js";
 import { Engine } from "../game/Engine.js";
-import { EngineError, EngineErrorCode } from "../game/types.js";
+import { EngineError, EngineErrorCode, PingRecord } from "../game/types.js";
 
 const INVITE_TTL_MS = 1000 * 60 * 60 * 6;
 
@@ -21,9 +21,6 @@ export class MafiaRoom extends Room {
   private auth = new Auth(this);
 
   messages = {
-    log: (_client: Client, _payload: { text: string }) => {
-      console.log("global log");
-    },
     vote: (_client: Client, _payload: { targetId: string }) => {
       console.log("voting");
     },
@@ -110,6 +107,34 @@ export class MafiaRoom extends Room {
       if (!this.requireHost(client)) return;
       this.runEngine(() => this.engine.resolveNight(), client);
     },
+    ping: (client: Client, payload: { toId: string }) => {
+      if (typeof payload?.toId !== "string") {
+        this.fail(client, "toId is required");
+        return;
+      }
+      let record: PingRecord;
+      try {
+        record = this.engine.ping(client.sessionId, payload.toId);
+      } catch (e) {
+        this.fail(client, this.engineErrorMessage(e));
+        return;
+      }
+
+      // Per ADR 0002: a player only sees pings they sent or received.
+      // The host sees every ping regardless of sender or recipient.
+      const recipient = this.clients.find((c) => c.sessionId === payload.toId);
+      if (recipient) recipient.send("ping", record);
+      // The sender already has the engine's record via the return value,
+      // but route it through the same private message for symmetry.
+      client.send("ping", record);
+      this.sendPingToHost(client.sessionId, payload.toId, record);
+    },
+    getLog: (client: Client, payload: { since?: string }) => {
+      if (!this.requireHost(client)) return;
+      const since = typeof payload?.since === "string" ? payload.since : "";
+      const entries = this.engine.getActionLogSince(since);
+      client.send("log", { entries });
+    },
   };
 
   onCreate(options: { password: string }) {
@@ -146,6 +171,34 @@ export class MafiaRoom extends Room {
     const ok = this.state.players.get(client.sessionId)?.isHost === true;
     if (!ok) this.fail(client, "Тільки хост може це робити");
     return ok;
+  }
+
+  /**
+   * Locate the host's connected client (if any). Returns `undefined` when the
+   * host seat exists but the client has already dropped.
+   */
+  private findHostClient(): Client | undefined {
+    let hostId = "";
+    for (const p of this.state.players.values()) {
+      if (p.isHost) {
+        hostId = p.sessionId;
+        break;
+      }
+    }
+    if (!hostId) return undefined;
+    return this.clients.find((c) => c.sessionId === hostId);
+  }
+
+  /**
+   * Route a ping record to the host's client (if connected). Skip when the
+   * host is also the sender or recipient — they already received the record
+   * directly.
+   */
+  private sendPingToHost(fromId: string, toId: string, record: PingRecord): void {
+    const host = this.findHostClient();
+    if (!host) return;
+    if (host.sessionId === fromId || host.sessionId === toId) return;
+    host.send("ping", record);
   }
 
   private fail(client: Client, message: string) {

@@ -5,7 +5,7 @@ import type { Room as SDKRoom } from "@colyseus/sdk";
 import appConfig from "../src/app.config.js";
 import { MafiaState } from "../src/rooms/schema/MafiaState.js";
 import { MafiaRoom } from "../src/rooms/MafiaRoom.js";
-import { Role } from "../src/rooms/schema/enums.js";
+import { Role, GamePhase } from "../src/rooms/schema/enums.js";
 
 interface Setup {
   room: MafiaRoom;
@@ -89,7 +89,7 @@ async function setupRoom(
   };
 }
 
-describe("mafia_room — Night-2 vertical slice", () => {
+describe("mafia_room", () => {
   let colyseus: ColyseusTestServer<typeof appConfig>;
 
   before(async () => (colyseus = await boot(appConfig)));
@@ -250,5 +250,130 @@ describe("mafia_room — Night-2 vertical slice", () => {
     for (let i = 0; i < guests.length; i++) {
       assert.strictEqual(guestMessages[i].length, 1, `guest ${i} should get one yourRole`);
     }
+  });
+
+  // ─── Ticket 02: pings + action log ────────────────────────────────────
+
+  it("two players exchange pings; each sees their own ping", async () => {
+    const { room, guests } = await setupRoom(colyseus, 10);
+
+    // Move into a day phase for pings.
+    room.state.phase = GamePhase.DAY_SPEECHES;
+    await room.waitForNextPatch();
+
+    const a = guests[0];
+    const b = guests[1];
+
+    const aPings: unknown[] = [];
+    const bPings: unknown[] = [];
+    a.onMessage("ping", (payload: unknown) => aPings.push(payload));
+    b.onMessage("ping", (payload: unknown) => bPings.push(payload));
+
+    a.send("ping", { toId: b.sessionId });
+    await room.waitForNextPatch();
+    b.send("ping", { toId: a.sessionId });
+    await room.waitForNextPatch();
+
+    assert.strictEqual(aPings.length, 2, "a is involved in two pings (sent one, received one)");
+    assert.strictEqual(bPings.length, 2, "b is involved in two pings (received one, sent one)");
+    const toA = aPings.find((p) => (p as { toId: string }).toId === a.sessionId);
+    assert.ok(toA, "a should see the ping sent to them");
+  });
+
+  it("players don't see each other's unrelated pings", async () => {
+    const { room, guests } = await setupRoom(colyseus, 10);
+    room.state.phase = GamePhase.DAY_SPEECHES;
+    await room.waitForNextPatch();
+
+    const a = guests[0];
+    const b = guests[1];
+    const c = guests[2]; // uninvolved spectator
+
+    const cPings: unknown[] = [];
+    c.onMessage("ping", (payload: unknown) => cPings.push(payload));
+
+    a.send("ping", { toId: b.sessionId });
+    await room.waitForNextPatch();
+
+    assert.strictEqual(cPings.length, 0, "c should not see a<->b pings");
+  });
+
+  it("host sees every ping regardless of sender or recipient", async () => {
+    const { room, host, guests } = await setupRoom(colyseus, 10);
+    room.state.phase = GamePhase.DAY_SPEECHES;
+    await room.waitForNextPatch();
+
+    const hostPings: unknown[] = [];
+    host.onMessage("ping", (payload: unknown) => hostPings.push(payload));
+
+    guests[0].send("ping", { toId: guests[1].sessionId });
+    await room.waitForNextPatch();
+    guests[2].send("ping", { toId: guests[3].sessionId });
+    await room.waitForNextPatch();
+
+    assert.strictEqual(hostPings.length, 2, "host should see every ping");
+    const toIds = hostPings.map((p) => (p as { toId: string }).toId).sort();
+    assert.deepStrictEqual(toIds, [guests[1].sessionId, guests[3].sessionId].sort());
+  });
+
+  it("civilian ping during the night is rejected and the host sees no record", async () => {
+    const { room, host, guests } = await setupRoom(colyseus, 10);
+    // Phase is NIGHT (default after startGame). Per setupRoom, guests[0]=DON,
+    // guests[1]=MAFIA, guests[2]=SHERIFF, guests[3]=DOCTOR, guests[4..]=CIVILIAN.
+    // We send from a civilian (guests[4]) to another civilian (guests[5]) so
+    // the ping is rejected regardless of role/target being mafia.
+
+    const hostPings: unknown[] = [];
+    host.onMessage("ping", (payload: unknown) => hostPings.push(payload));
+
+    const errors: string[] = [];
+    guests[4].onMessage("error", (msg: unknown) => {
+      errors.push(String((msg as { message?: string }).message ?? msg));
+    });
+
+    guests[4].send("ping", { toId: guests[5].sessionId });
+    await room.waitForNextPatch();
+
+    assert.ok(errors.length > 0, "civilian ping during night must error");
+    assert.strictEqual(hostPings.length, 0, "rejected ping must not reach the host either");
+    assert.strictEqual(room.engine.getAllPings().length, 0);
+  });
+
+  it("host can fetch the action log via getLog", async () => {
+    const { room, host, guests } = await setupRoom(colyseus, 10);
+    room.state.phase = GamePhase.DAY_SPEECHES;
+    await room.waitForNextPatch();
+    guests[0].send("ping", { toId: guests[1].sessionId });
+    await room.waitForNextPatch();
+
+    const received: unknown[] = [];
+    host.onMessage("log", (payload: unknown) => received.push(payload));
+
+    host.send("getLog", { since: "" });
+    await room.waitForNextPatch();
+
+    assert.strictEqual(received.length, 1, "host should receive exactly one log response");
+    const entries = (received[0] as { entries: Array<{ type: string }> }).entries;
+    assert.ok(entries.length >= 2, `expected >=2 entries, got ${entries.length}`);
+    const types = entries.map((e) => e.type);
+    assert.ok(types.includes("PING"), "log should include the PING entry");
+    assert.ok(types.includes("PHASE_ADVANCE"), "log should include the game-started PHASE_ADVANCE");
+  });
+
+  it("non-host is rejected when requesting the action log", async () => {
+    const { room, guests } = await setupRoom(colyseus, 10);
+
+    const received: unknown[] = [];
+    const errors: string[] = [];
+    guests[0].onMessage("log", (payload: unknown) => received.push(payload));
+    guests[0].onMessage("error", (msg: unknown) => {
+      errors.push(String((msg as { message?: string }).message ?? msg));
+    });
+
+    guests[0].send("getLog", { since: "" });
+    await room.waitForNextPatch();
+
+    assert.strictEqual(received.length, 0, "non-host must never receive the log");
+    assert.ok(errors.length > 0, "non-host should receive an error");
   });
 });
