@@ -1,8 +1,8 @@
-import { Room, Client, ServerError } from "@colyseus/core";
-import { MafiaState, Player } from "./schema/MafiaState.js";
+import { Room, Client } from "@colyseus/core";
+import { MafiaState } from "./schema/MafiaState.js";
 import { Auth } from "../config/auth.js";
 
-const INVITE_TTL_MS = 1000 * 60 * 60 * 6; // 6 годин
+const INVITE_TTL_MS = 1000 * 60 * 60 * 6;
 
 export class MafiaRoom extends Room {
   maxClients = 12;
