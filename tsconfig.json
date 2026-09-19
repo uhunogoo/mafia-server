@@ -12,7 +12,8 @@
     "experimentalDecorators": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
-    "useDefineForClassFields": false
+    "useDefineForClassFields": false,
+    "types": ["mocha", "node"]
   },
   "include": [
     "src",

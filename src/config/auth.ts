@@ -1,7 +1,6 @@
-import { type Client, ServerError, CloseCode, ErrorCode } from "@colyseus/core";
+import { type Client, ServerError, ErrorCode } from "@colyseus/core";
 import type { MafiaRoom } from "../rooms/MafiaRoom.js";
 import { Player } from "../rooms/schema/MafiaState.js";
-// import { JWT } from "@colyseus/auth";
 
 export interface AuthPayload {
   name: string;
@@ -37,7 +36,6 @@ export class Auth {
     player.sessionId = client.sessionId;
     player.seatIndex = room.state.players.size;
     player.isHost = isHost;
-    player.role = isHost ? "master" : "";
 
     room.state.players.set(client.sessionId, player);
   }
@@ -57,7 +55,6 @@ export class Auth {
       .sort((a, b) => a.seatIndex - b.seatIndex);
     if (players.length > 0 && !players.some((p) => p.isHost)) {
       players[0].isHost = true;
-      players[0].role = "master";
     }
   }
 }
