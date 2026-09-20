@@ -757,4 +757,259 @@ describe("mafia_room", () => {
     assert.strictEqual(reminders[1].mode, "MAFIA_WINDOW");
     assert.strictEqual(reminders[1].remainingSeconds, 10);
   });
+
+  // ─── Ticket 05: disconnect pause + declareDead ────────────────────────
+
+  it("a player dropping mid-phase pauses the timer and notifies the host", async () => {
+    const { room, host, guests } = await setupRoom(colyseus, 10);
+
+    const missing: Array<{ sessionId: string }> = [];
+    host.onMessage("playerMissing", (payload: unknown) =>
+      missing.push(payload as { sessionId: string }),
+    );
+
+    // The MAFIA_WINDOW timer is running right after startGame — assert it.
+    assert.strictEqual(room.engine.getPhaseTimer()?.mode, "MAFIA_WINDOW");
+    assert.strictEqual(room.engine.getPhaseTimer()?.paused, false);
+
+    const droppedId = guests[5].sessionId;
+    (room as unknown as { _simulateDropForTest(s: string): void })._simulateDropForTest(droppedId);
+    await room.waitForNextPatch();
+    // Allow the host notification to flush through the SDK.
+    await new Promise((r) => setTimeout(r, 50));
+
+    // Schema flip: missing flag set on the dropped player.
+    assert.strictEqual(
+      room.state.players.get(droppedId)!.isMissing,
+      true,
+      "Player.isMissing flipped to true",
+    );
+    // Timer paused.
+    assert.strictEqual(
+      room.engine.getPhaseTimer()!.paused,
+      true,
+      "MAFIA_WINDOW paused for missing player",
+    );
+    // Host got the notification.
+    assert.strictEqual(missing.length, 1, "host received exactly one playerMissing");
+    assert.strictEqual(missing[0].sessionId, droppedId);
+  });
+
+  it("declareDead marks the missing player dead, resumes the timer, and routes through onPlayerDied", async () => {
+    const { room, host, guests } = await setupRoom(colyseus, 10);
+
+    let deadId = "";
+    let deadCause = "";
+    room.engine.setOnPlayerDied((id, cause) => {
+      deadId = id;
+      deadCause = cause;
+    });
+
+    const declared: Array<{ sessionId: string }> = [];
+    host.onMessage("playerDeclaredDead", (payload: unknown) =>
+      declared.push(payload as { sessionId: string }),
+    );
+
+    const droppedId = guests[5].sessionId;
+    (room as unknown as { _simulateDropForTest(s: string): void })._simulateDropForTest(droppedId);
+    await room.waitForNextPatch();
+    assert.strictEqual(room.engine.getPhaseTimer()!.paused, true);
+
+    host.send("declareDead", { sessionId: droppedId });
+    await room.waitForNextPatch();
+    await new Promise((r) => setTimeout(r, 50));
+
+    // Schema: dead and not missing.
+    assert.strictEqual(
+      room.state.players.get(droppedId)!.isAlive,
+      false,
+      "Player.isAlive = false after declareDead",
+    );
+    assert.strictEqual(
+      room.state.players.get(droppedId)!.isMissing,
+      false,
+      "Player.isMissing cleared after declareDead",
+    );
+
+    // Timer resumed — MAFIA_WINDOW gets a fresh 60s nudge cycle, same shape
+    // as resumePhase after mafia-window expiry. The snapshot reads the real
+    // clock, so a few hundred ms may have ticked between declareDead and
+    // the snapshot call (we round-trip through Colyseus + add a 50ms sleep).
+    // Assert a 60s window up to a half-second drift.
+    const snap = room.engine.getPhaseTimer();
+    assert.ok(snap, "MAFIA_WINDOW re-armed");
+    assert.strictEqual(snap!.paused, false);
+    assert.strictEqual(snap!.mode, "MAFIA_WINDOW");
+    assert.ok(
+      snap!.remainingMs >= 59_500 && snap!.remainingMs <= 60_000,
+      `fresh ~60s window after declareDead, got ${snap!.remainingMs}`,
+    );
+
+    // Seam fired with DECLARED_DEAD.
+    assert.strictEqual(deadId, droppedId);
+    assert.strictEqual(deadCause, "DECLARED_DEAD");
+
+    // Host got the notification.
+    assert.strictEqual(declared.length, 1);
+    assert.strictEqual(declared[0].sessionId, droppedId);
+  });
+
+  it("non-host is rejected when sending declareDead", async () => {
+    const { room, guests } = await setupRoom(colyseus, 10);
+    const droppedId = guests[5].sessionId;
+    (room as unknown as { _simulateDropForTest(s: string): void })._simulateDropForTest(droppedId);
+    await room.waitForNextPatch();
+
+    const errors: string[] = [];
+    guests[0].onMessage("error", (msg: unknown) => {
+      errors.push(String((msg as { message?: string }).message ?? msg));
+    });
+
+    guests[0].send("declareDead", { sessionId: droppedId });
+    await room.waitForNextPatch();
+
+    assert.ok(errors.length > 0, "non-host should receive an error");
+    // Player must remain alive — the rejection didn't run the engine method.
+    assert.strictEqual(room.state.players.get(droppedId)!.isAlive, true);
+    // Still missing — the rejection didn't clear the flag.
+    assert.strictEqual(room.state.players.get(droppedId)!.isMissing, true);
+  });
+
+  it("declareDead requires the target to be missing", async () => {
+    const { room, host, guests } = await setupRoom(colyseus, 10);
+    // No drop happened — guests[5] is alive and not missing.
+
+    const errors: string[] = [];
+    host.onMessage("error", (msg: unknown) => {
+      errors.push(String((msg as { message?: string }).message ?? msg));
+    });
+
+    host.send("declareDead", { sessionId: guests[5].sessionId });
+    await room.waitForNextPatch();
+
+    assert.ok(errors.length > 0, "declareDead on a non-missing player must error");
+    assert.strictEqual(room.state.players.get(guests[5].sessionId)!.isAlive, true);
+  });
+
+  it("the marked-dead player cannot perform actions (vote rejected with PLAYER_DEAD)", async () => {
+    const setup = await setupRoom(colyseus, 10);
+
+    // Drop and declare dead.
+    const droppedId = setup.guests[5].sessionId;
+    (setup.room as unknown as { _simulateDropForTest(s: string): void })._simulateDropForTest(droppedId);
+    await setup.room.waitForNextPatch();
+    setup.host.send("declareDead", { sessionId: droppedId });
+    await setup.room.waitForNextPatch();
+
+    // Drive into DAY_VOTING so the dead guest can try to vote.
+    setup.host.send("mafiaKill", { targetId: setup.guests[7].sessionId });
+    await setup.room.waitForNextPatch();
+    setup.guests[3].send("doctorHeal", { targetId: setup.guests[7].sessionId });
+    await setup.room.waitForNextPatch();
+    setup.host.send("resolveNight");
+    await setup.room.waitForNextPatch();
+    setup.host.send("startSpeeches");
+    await setup.room.waitForNextPatch();
+    setup.guests[0].send("nominate", { targetId: setup.guests[6].sessionId });
+    await setup.room.waitForNextPatch();
+    const order = setup.room.engine.getSpeakingOrder();
+    for (let i = 0; i < order.length; i++) {
+      setup.host.send("nextSpeaker");
+      await setup.room.waitForNextPatch();
+    }
+    const dOrder = setup.room.engine.getDefenseOrder();
+    for (let i = 0; i < dOrder.length; i++) {
+      setup.host.send("nextDefense");
+      await setup.room.waitForNextPatch();
+    }
+    assert.strictEqual(setup.room.state.phase, GamePhase.DAY_VOTING);
+
+    const errors: string[] = [];
+    setup.guests[5].onMessage("error", (msg: unknown) => {
+      errors.push(String((msg as { message?: string }).message ?? msg));
+    });
+
+    setup.guests[5].send("vote", { targetId: setup.guests[6].sessionId });
+    await setup.room.waitForNextPatch();
+
+    assert.ok(errors.length > 0, "vote from a declared-dead player must error");
+  });
+
+  it("a drop in DAY_VOTING (no timer) is recorded but doesn't try to pause a timer", async () => {
+    const setup = await setupRoom(colyseus, 10);
+    // Drive into DAY_VOTING with one nomination.
+    setup.host.send("mafiaKill", { targetId: setup.guests[7].sessionId });
+    await setup.room.waitForNextPatch();
+    setup.guests[3].send("doctorHeal", { targetId: setup.guests[9].sessionId });
+    await setup.room.waitForNextPatch();
+    setup.host.send("resolveNight");
+    await setup.room.waitForNextPatch();
+    setup.host.send("startSpeeches");
+    await setup.room.waitForNextPatch();
+    setup.guests[0].send("nominate", { targetId: setup.guests[6].sessionId });
+    await setup.room.waitForNextPatch();
+    const order = setup.room.engine.getSpeakingOrder();
+    for (let i = 0; i < order.length; i++) {
+      setup.host.send("nextSpeaker");
+      await setup.room.waitForNextPatch();
+    }
+    const dOrder = setup.room.engine.getDefenseOrder();
+    for (let i = 0; i < dOrder.length; i++) {
+      setup.host.send("nextDefense");
+      await setup.room.waitForNextPatch();
+    }
+    assert.strictEqual(setup.room.state.phase, GamePhase.DAY_VOTING);
+    assert.strictEqual(setup.room.engine.getPhaseTimer(), null, "no timer in DAY_VOTING");
+
+    const droppedId = setup.guests[5].sessionId;
+    (setup.room as unknown as { _simulateDropForTest(s: string): void })._simulateDropForTest(droppedId);
+    await setup.room.waitForNextPatch();
+
+    assert.strictEqual(setup.room.state.players.get(droppedId)!.isMissing, true);
+    assert.deepStrictEqual(setup.room.engine.getMissingPlayers(), [droppedId]);
+    assert.strictEqual(setup.room.engine.getPhaseTimer(), null, "no timer was armed by the drop");
+
+    // declareDead still works and fires the seam.
+    let fired = false;
+    let cause = "";
+    setup.room.engine.setOnPlayerDied((id, c) => {
+      fired = true;
+      cause = c;
+      assert.strictEqual(id, droppedId);
+    });
+    setup.host.send("declareDead", { sessionId: droppedId });
+    await setup.room.waitForNextPatch();
+    assert.strictEqual(setup.room.state.players.get(droppedId)!.isAlive, false);
+    assert.strictEqual(fired, true);
+    assert.strictEqual(cause, "DECLARED_DEAD");
+  });
+
+  it("PLAYER_MISSING and PLAYER_RETURNED entries appear in the host's action log", async () => {
+    const { room, host, guests } = await setupRoom(colyseus, 10);
+
+    const droppedId = guests[5].sessionId;
+    (room as unknown as { _simulateDropForTest(s: string): void })._simulateDropForTest(droppedId);
+    await room.waitForNextPatch();
+
+    // Log the missing event.
+    const logEntries: Array<{ entries: Array<{ type: string; payload?: Record<string, unknown> }> }> = [];
+    host.onMessage("log", (payload: unknown) =>
+      logEntries.push(payload as { entries: Array<{ type: string; payload?: Record<string, unknown> }> }),
+    );
+    host.send("getLog", { since: "" });
+    await room.waitForNextPatch();
+    assert.ok(logEntries.length > 0, "host received a log response");
+    const types = logEntries[0].entries.map((e) => e.type);
+    assert.ok(types.includes("PLAYER_MISSING"), `log includes PLAYER_MISSING, got ${types.join(", ")}`);
+
+    // Host calls declareDead → DEAD_DECLARED entry also appears.
+    logEntries.length = 0;
+    host.send("declareDead", { sessionId: droppedId });
+    await room.waitForNextPatch();
+
+    host.send("getLog", { since: "" });
+    await room.waitForNextPatch();
+    const types2 = logEntries[0].entries.map((e) => e.type);
+    assert.ok(types2.includes("DEAD_DECLARED"), `log includes DEAD_DECLARED, got ${types2.join(", ")}`);
+  });
 });

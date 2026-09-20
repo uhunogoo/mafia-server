@@ -26,11 +26,24 @@ export class Auth {
     return { name: name };
   }
 
-  onJoin( client: Client ) {
+  onJoin(client: Client) {
     const { name } = client.auth as { name: string };
     const room = this.room;
-    const isHost = room.state.players.size === 0;
+    const existing = room.state.players.get(client.sessionId);
 
+    // Idempotency guard (ticket 05): when a client reconnects during the
+    // Colyseus reconnection grace window, `onJoin` is called again with the
+    // SAME sessionId. The player is still in `room.state.players` and may
+    // carry runtime flags (`isAlive`, `isMissing`, role assignments) that
+    // must NOT be clobbered. Only the display name is refreshed — the host
+    // flag and seat are untouched. A missing-player clear is the room's
+    // responsibility (see `MafiaRoom.onJoin`), not auth's.
+    if (existing) {
+      existing.name = name;
+      return;
+    }
+
+    const isHost = room.state.players.size === 0;
     const player = new Player();
     player.name = name;
     player.sessionId = client.sessionId;

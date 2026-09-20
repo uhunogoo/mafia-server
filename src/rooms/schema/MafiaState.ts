@@ -12,6 +12,7 @@ export class Player extends Schema {
   @type("boolean") isAlive: boolean = true;
   @type("boolean") isHost: boolean = false;
   @type("boolean") isNominated: boolean = false;
+  @type("boolean") isMissing: boolean = false;
   @type("number") votes: number = 0;
 }
 

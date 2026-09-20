@@ -164,6 +164,20 @@ export class MafiaRoom extends Room {
       }
       this.runEngine(() => this.engine.extendPhase(client.sessionId, seconds), client);
     },
+    declareDead: (client: Client, payload: { sessionId: string }) => {
+      if (!this.requireHost(client)) return;
+      if (typeof payload?.sessionId !== "string") {
+        this.fail(client, "sessionId is required");
+        return;
+      }
+      const targetId = payload.sessionId;
+      this.runEngine(() => {
+        this.engine.declareDead(client.sessionId, targetId);
+        // Notification goes out only after the engine accepts — keeps the
+        // host UI in sync with the canonical state.
+        this.notifyHostOfDeclaredDead(targetId);
+      }, client);
+    },
     ping: (client: Client, payload: { toId: string }) => {
       if (typeof payload?.toId !== "string") {
         this.fail(client, "toId is required");
@@ -219,15 +233,46 @@ export class MafiaRoom extends Room {
   }
 
   onJoin(client: Client) {
+    // `auth.onJoin` is idempotent: on reconnect during the 30s grace window
+    // it preserves the existing `Player` (so `isAlive` / `isMissing` / role
+    // are not clobbered), and only refreshes the name. The room then clears
+    // the missing flag and notifies the host — this is the single,
+    // deterministic reconnect-detection path. We intentionally do NOT do a
+    // periodic reconciliation in `drivePhaseTimer` because the Colyseus
+    // reconnection grace keeps the client in `this.clients` for the full
+    // 30 seconds, so a periodic scan would race with the grace window and
+    // wrongly clear the missing flag on the original drop.
+    //
+    // `clearMissing` is itself idempotent and short-circuits when the
+    // player isn't in the missing set, so calling it unconditionally and
+    // notifying on a `true` return is enough — no need for a pre-check.
     this.auth.onJoin(client);
+    if (this.engine.clearMissing(client.sessionId)) {
+      this.notifyHostOfPlayerReturned(client.sessionId);
+    }
   }
 
   onDrop(client: Client) {
     this.auth.onDrop(client);
+    // Ticket 05: a mid-game drop pauses the phase and notifies the host. The
+    // 30-second Colyseus reconnection window is what gives the host the
+    // breathing room to call `declareDead`. LOBBY/GAME_OVER drops are no-ops
+    // because there is no live phase to pause.
+    if (this.engine.pauseForMissing(client.sessionId)) {
+      this.notifyHostOfPlayerMissing(client.sessionId);
+    }
   }
 
   onLeave(client: Client) {
     this.auth.onLeave(client);
+    // The Colyseus reconnection grace has expired without a reconnect. If
+    // the player was still flagged missing, clear the flag now so the phase
+    // resumes — the player is gone, but the game must keep moving. The host
+    // had a 30s window to call `declareDead` if they wanted the player dead.
+    // `clearMissing` is idempotent; no need for a defensive second call.
+    if (this.engine.clearMissing(client.sessionId)) {
+      this.notifyHostOfPlayerReturned(client.sessionId);
+    }
   }
 
   onDispose() {
@@ -275,6 +320,41 @@ export class MafiaRoom extends Room {
     if (!host) return;
     if (host.sessionId === fromId || host.sessionId === toId) return;
     host.send("ping", record);
+  }
+
+  /**
+   * Ticket 05: notify the host that `sessionId` dropped mid-phase. The host
+   * UI uses this to surface a "player missing — declare dead?" affordance.
+   * Real-time push, on top of the `PLAYER_MISSING` entry in the action log.
+   */
+  private notifyHostOfPlayerMissing(sessionId: string): void {
+    const host = this.findHostClient();
+    if (!host) return;
+    host.send("playerMissing", { sessionId });
+  }
+
+  /**
+   * Ticket 05: notify the host that `sessionId` either reconnected within
+   * the grace window OR that the reconnection grace expired without a
+   * reconnect (the player has left). In both cases the engine has cleared
+   * the missing flag and the phase has resumed; the host UI uses this to
+   * dismiss the missing affordance.
+   */
+  private notifyHostOfPlayerReturned(sessionId: string): void {
+    const host = this.findHostClient();
+    if (!host) return;
+    host.send("playerReturned", { sessionId });
+  }
+
+  /**
+   * Ticket 05: notify the host that `sessionId` was declared dead. Pairs
+   * with the engine's `DEAD_DECLARED` action-log entry; the host UI uses
+   * both signals to update the seat badge.
+   */
+  private notifyHostOfDeclaredDead(sessionId: string): void {
+    const host = this.findHostClient();
+    if (!host) return;
+    host.send("playerDeclaredDead", { sessionId });
   }
 
   /**
@@ -360,6 +440,19 @@ export class MafiaRoom extends Room {
       return events;
     } finally {
       this.engine._setClockForTest(original);
+    }
+  }
+
+  /**
+   * Test-only (ticket 05): simulate a player dropping by running the same
+   * path as the room's `onDrop` handler. This bypasses the Colyseus
+   * WebSocket transport so tests don't have to wrestle with closing the
+   * underlying connection mid-test. Mirrors `onDrop` exactly so the
+   * engine state, action-log entry, and host notification all line up.
+   */
+  _simulateDropForTest(sessionId: string): void {
+    if (this.engine.pauseForMissing(sessionId)) {
+      this.notifyHostOfPlayerMissing(sessionId);
     }
   }
 }

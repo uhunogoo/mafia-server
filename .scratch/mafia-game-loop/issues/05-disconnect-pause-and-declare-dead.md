@@ -6,9 +6,9 @@
 
 **Status:** ready-for-agent
 
-- [ ] A player who drops during a live phase causes the phase to pause.
-- [ ] The host receives a "player missing" notification with the sessionId.
-- [ ] Host can issue `declareDead{sessionId}` to mark the missing player dead and resume the phase.
-- [ ] The marked-dead player cannot perform actions if they reconnect.
-- [ ] `declareDead` routes through the engine's `onPlayerDied` seam so the victory check fires.
-- [ ] Test: drop → phase pauses and host is notified; `declareDead` → phase resumes with the player marked dead and routed through `onPlayerDied`.
+- [x] A player who drops during a live phase causes the phase to pause.
+- [x] The host receives a "player missing" notification with the sessionId.
+- [x] Host can issue `declareDead{sessionId}` to mark the missing player dead and resume the phase.
+- [x] The marked-dead player cannot perform actions if they reconnect.
+- [x] `declareDead` routes through the engine's `onPlayerDied` seam so the victory check fires.
+- [x] Test: drop → phase pauses and host is notified; `declareDead` → phase resumes with the player marked dead and routed through `onPlayerDied`.

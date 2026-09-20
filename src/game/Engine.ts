@@ -72,6 +72,18 @@ function shuffle<T>(items: readonly T[]): T[] {
  *    the timer (skip on a per-turn phase calls the same internal transition
  *    that timer expiry would)
  *
+ * Slice-5 (ticket 05) adds disconnect pause + declareDead:
+ *  - pauseForMissing pauses the phase timer when a player drops mid-phase,
+ *    marks them missing in the public schema, and emits a host notification
+ *    via the action log; the room forwards that notification to the host
+ *  - clearMissing clears the missing flag and resumes the timer when the
+ *    player reconnects within the Colyseus reconnection window (30s)
+ *  - declareDead marks a missing player dead (permanently, even if they
+ *    later reconnect), fires the onPlayerDied seam with DECLARED_DEAD, and
+ *    resumes the timer; the same seam that observes vote eliminations and
+ *    mafia kills observes the declaration so future victory-check work
+ *    (ticket 09) plugs in transparently
+ *
  * The engine never touches the network; the room translates `EngineError`
  * into player-visible messages and `client.send` for private role reveals.
  */
@@ -150,11 +162,22 @@ export class Engine {
 
   /**
    * Optional seam fired whenever a player dies. Day-cycle elimination calls it
-   * with `VOTE_ELIMINATION`; night mafia kills call `MAFIA_KILL`; follow-up
-   * tickets (05) add `DECLARED_DEAD` for host-declared dead on disconnect.
-   * The room uses this hook to run victory checks and host notifications.
+   * with `VOTE_ELIMINATION`; night mafia kills call `MAFIA_KILL`; ticket 05
+   * adds `DECLARED_DEAD` for host-declared dead on disconnect. The room uses
+   * this hook to run victory checks and host notifications.
    */
   private onPlayerDied: ((sessionId: string, cause: DeathCause) => void) | null = null;
+
+  /**
+   * SessionIds of players who have dropped but not yet been declared dead.
+   * At most one missing player at a time: a second drop while the phase is
+   * already paused for the first is ignored (idempotent). The set drives the
+   * `Player.isMissing` flag in the public schema and gates `declareDead`
+   * (the host can only declare a missing player dead, not an arbitrary one).
+   * Cleared automatically when the player reconnects (`clearMissing`) or
+   * when the host resolves the pause (`declareDead`).
+   */
+  private missing = new Set<string>();
 
   private nextEntryId = 0;
 
@@ -495,6 +518,11 @@ export class Engine {
    * Register a callback fired whenever a player dies. The room subscribes to
    * observe elimination so it can run victory checks and host notifications.
    * Pass `null` to unsubscribe. A single callback overwrites any previous one.
+   *
+   * `DECLARED_DEAD` is the only cause where the dead flag is set *after* a
+   * disconnect-pause is resolved by the host. The other two causes
+   * (`VOTE_ELIMINATION`, `MAFIA_KILL`) are issued by the day/night cycle
+   * itself.
    */
   setOnPlayerDied(callback: ((sessionId: string, cause: DeathCause) => void) | null): void {
     this.onPlayerDied = callback;
@@ -1174,6 +1202,157 @@ export class Engine {
       type: ActionType.PHASE_OVERRIDE,
       payload: { event: "extend", mode: this.phaseTimer.mode, seconds },
     });
+  }
+
+  // ─── Disconnect pause + declareDead (ticket 05) ──────────────────────────
+
+  /**
+   * SessionIds of players who are currently missing (dropped, awaiting the
+   * host's `declareDead` decision). The set is the source of truth for
+   * `Player.isMissing` in the public schema; the room reads it indirectly
+   * via the schema field and via the `PLAYER_MISSING` / `PLAYER_RETURNED`
+   * entries in the action log.
+   */
+  getMissingPlayers(): string[] {
+    return [...this.missing];
+  }
+
+  /**
+   * Called by the room when a player drops mid-phase. Pauses the phase
+   * timer (if any), marks the player missing in the public schema, and
+   * records a `PLAYER_MISSING` entry in the host's action log so the host
+   * UI can surface the notification. Idempotent: a second drop while the
+   * phase is already paused for someone else is a no-op.
+   *
+   * Returns `true` when state actually changed (room should notify the
+   * host); `false` for the silent no-op cases (LOBBY/GAME_OVER, already
+   * missing, not at the table, or already dead).
+   *
+   * Disconnects in LOBBY and GAME_OVER are silently ignored — there is no
+   * phase to pause. The room is expected to drop the player from
+   * `state.players` via the normal Colyseus flow in that case.
+   */
+  pauseForMissing(sessionId: string): boolean {
+    if (
+      this.state.phase === GamePhase.LOBBY ||
+      this.state.phase === GamePhase.GAME_OVER
+    ) {
+      return false;
+    }
+    if (this.missing.has(sessionId)) return false;
+    const player = this.state.players.get(sessionId);
+    if (!player) return false;
+    if (!player.isAlive) return false;
+
+    this.missing.add(sessionId);
+    player.isMissing = true;
+    if (this.phaseTimer && !this.phaseTimer.isPaused()) {
+      this.phaseTimer.pause(this.now());
+    }
+    this.logEntry({
+      actorSessionId: "",
+      type: ActionType.PLAYER_MISSING,
+      payload: { sessionId },
+    });
+    return true;
+  }
+
+  /**
+   * Called by the room when a missing player reconnects within the
+   * Colyseus reconnection window (default 30s) or when the reconnection
+   * grace expires without a reconnect. Clears the missing flag and resumes
+   * the timer if it was paused for the drop. No-op if the player wasn't
+   * missing.
+   *
+   * Returns `true` when state actually changed (room should notify the
+   * host); `false` for the silent no-op case.
+   *
+   * If the host already called `declareDead` (so the player is permanently
+   * dead in the schema), `declareDead` has already cleared them from the
+   * missing set; `clearMissing` is a no-op in that case.
+   */
+  clearMissing(sessionId: string): boolean {
+    if (!this.missing.has(sessionId)) return false;
+    this.missing.delete(sessionId);
+    const player = this.state.players.get(sessionId);
+    if (player) player.isMissing = false;
+    this.resumePausedTimer();
+    this.logEntry({
+      actorSessionId: "",
+      type: ActionType.PLAYER_RETURNED,
+      payload: { sessionId },
+    });
+    return true;
+  }
+
+  /**
+   * Host-only: declare a missing player dead and resume the phase. The
+   * player is removed from the missing set, `Player.isAlive` is cleared
+   * (so any reconnect attempt will be rebuffed by `requireAlivePlayer`),
+   * and the `onPlayerDied` seam fires with `DECLARED_DEAD` — the same
+   * observation point that handles vote eliminations and mafia kills, so
+   * the future victory-check work in ticket 09 picks up declared-dead
+   * players automatically.
+   *
+   * Guards: requires host, requires `sessionId` to be at the table and
+   * currently missing. Re-declaring an already-dead player is rejected
+   * with PLAYER_DEAD; declaring a player who isn't missing is rejected
+   * with WRONG_ROLE (the host can only resolve a known disconnect).
+   */
+  declareDead(hostSessionId: string, sessionId: string): void {
+    this.requireHost(hostSessionId);
+    const player = this.state.players.get(sessionId);
+    if (!player) {
+      throw new EngineError(
+        EngineErrorCode.PLAYER_MISSING,
+        `Player ${sessionId} is not at the table`,
+      );
+    }
+    if (!this.missing.has(sessionId)) {
+      throw new EngineError(
+        EngineErrorCode.WRONG_ROLE,
+        `Player ${sessionId} is not missing — only a missing player can be declared dead`,
+      );
+    }
+    if (!player.isAlive) {
+      throw new EngineError(
+        EngineErrorCode.PLAYER_DEAD,
+        `Player ${sessionId} is already dead`,
+      );
+    }
+
+    this.missing.delete(sessionId);
+    player.isMissing = false;
+    player.isAlive = false;
+
+    this.logEntry({
+      actorSessionId: hostSessionId,
+      type: ActionType.DEAD_DECLARED,
+      payload: { sessionId },
+    });
+
+    // Fire the seam BEFORE resuming the timer so any host-side victory
+    // check that wants to inspect post-death state (e.g. did this kill
+    // the last mafia?) sees the public schema already updated.
+    this.onPlayerDied?.(sessionId, "DECLARED_DEAD");
+
+    this.resumePausedTimer();
+  }
+
+  /**
+   * Resume a timer that was paused by `pauseForMissing` (or, equivalently,
+   * by `declareDead`). The semantics mirror `resumePhase`: the mafia
+   * window re-arms a fresh 60s, everything else picks up from the pause
+   * point. No-op if the timer wasn't paused or there is no active timer.
+   */
+  private resumePausedTimer(): void {
+    if (!this.phaseTimer) return;
+    if (!this.phaseTimer.isPaused()) return;
+    if (this.phaseTimer.mode === "MAFIA_WINDOW") {
+      this.startTimer("MAFIA_WINDOW");
+    } else {
+      this.phaseTimer.resume(this.now());
+    }
   }
 
   /**

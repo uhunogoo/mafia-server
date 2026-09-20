@@ -1523,3 +1523,303 @@ describe("Engine — host phase overrides", () => {
     assert.deepStrictEqual(engine.tickPhaseTimer(), []);
   });
 });
+
+describe("Engine — disconnect pause + declareDead (ticket 05)", () => {
+  /** Start a fresh night so a MAFIA_WINDOW timer is armed. */
+  function startNight(): { state: MafiaState; engine: Engine; now: { value: number } } {
+    const state = freshState(10);
+    const now = { value: 0 };
+    const engine = new Engine(state, () => now.value);
+    engine.startGame();
+    return { state, engine, now };
+  }
+
+  /** Drive the engine through a full day cycle so it is at DAY_VOTING with no timer. */
+  function inDay1Voting(): { state: MafiaState; engine: Engine; now: { value: number } } {
+    const { state } = startNight();
+    const now = { value: 0 };
+    const engine = new Engine(state, () => now.value);
+    engine._assignRoleForTest("p3", Role.DOCTOR);
+    engine.mafiaKill("host", "p4");
+    engine.doctorHeal("p3", "p4");
+    engine.resolveNight();
+    engine.startSpeeches();
+    engine.nominate("p0", "p6");
+    while (engine.state.phase !== GamePhase.DAY_DEFENSE) engine.nextSpeaker();
+    while (engine.state.phase !== GamePhase.DAY_VOTING) engine.nextDefense();
+    return { state, engine, now };
+  }
+
+  it("pauseForMissing marks the player missing and pauses the active timer", () => {
+    const { engine, state } = startNight();
+    assert.strictEqual(state.players.get("p3")!.isMissing, false);
+
+    const result = engine.pauseForMissing("p3");
+
+    assert.strictEqual(result, true, "first call returns true (state changed)");
+    assert.strictEqual(state.players.get("p3")!.isMissing, true, "schema flag flipped");
+    assert.strictEqual(engine.getPhaseTimer()!.paused, true, "active timer paused");
+    assert.deepStrictEqual(engine.getMissingPlayers(), ["p3"]);
+  });
+
+  it("pauseForMissing emits a PLAYER_MISSING entry in the host action log", () => {
+    const { engine } = startNight();
+    engine.pauseForMissing("p3");
+
+    const lastLog = engine.getActionLog().at(-1)!;
+    assert.strictEqual(lastLog.type, "PLAYER_MISSING");
+    assert.strictEqual((lastLog.payload as { sessionId: string }).sessionId, "p3");
+  });
+
+  it("pauseForMissing is idempotent — second call returns false and does not re-log", () => {
+    const { engine } = startNight();
+    assert.strictEqual(engine.pauseForMissing("p3"), true);
+    const logLenAfterFirst = engine.getActionLog().length;
+
+    assert.strictEqual(engine.pauseForMissing("p3"), false, "second call is a no-op");
+    assert.strictEqual(engine.getActionLog().length, logLenAfterFirst, "no duplicate log entry");
+  });
+
+  it("pauseForMissing returns false in LOBBY (no live phase to pause)", () => {
+    const state = freshState(10);
+    const engine = new Engine(state);
+    assert.strictEqual(state.phase, GamePhase.LOBBY);
+
+    const result = engine.pauseForMissing("p3");
+
+    assert.strictEqual(result, false);
+    assert.strictEqual(state.players.get("p3")!.isMissing, false);
+    assert.strictEqual(engine.getMissingPlayers().length, 0);
+  });
+
+  it("pauseForMissing returns false for a player who is not at the table", () => {
+    const { engine } = startNight();
+    assert.strictEqual(engine.pauseForMissing("ghost"), false);
+    assert.strictEqual(engine.getMissingPlayers().length, 0);
+  });
+
+  it("pauseForMissing returns false for an already-dead player", () => {
+    const { engine, state } = startNight();
+    state.players.get("p3")!.isAlive = false;
+    assert.strictEqual(engine.pauseForMissing("p3"), false);
+    assert.strictEqual(state.players.get("p3")!.isMissing, false);
+  });
+
+  it("clearMissing clears the flag and resumes the timer (player reconnected within grace)", () => {
+    const { engine, state } = startNight();
+    engine.pauseForMissing("p3");
+    assert.strictEqual(engine.getPhaseTimer()!.paused, true);
+
+    const result = engine.clearMissing("p3");
+
+    assert.strictEqual(result, true);
+    assert.strictEqual(state.players.get("p3")!.isMissing, false);
+    assert.strictEqual(engine.getMissingPlayers().length, 0);
+    // MAFIA_WINDOW resumes into a fresh 60s nudge cycle (matches resumePhase).
+    const snap = engine.getPhaseTimer();
+    assert.ok(snap, "timer still armed after reconnect");
+    assert.strictEqual(snap!.paused, false);
+    assert.strictEqual(snap!.mode, "MAFIA_WINDOW");
+    assert.strictEqual(snap!.remainingMs, 60_000);
+  });
+
+  it("clearMissing emits a PLAYER_RETURNED entry in the host action log", () => {
+    const { engine } = startNight();
+    engine.pauseForMissing("p3");
+    engine.clearMissing("p3");
+
+    const lastLog = engine.getActionLog().at(-1)!;
+    assert.strictEqual(lastLog.type, "PLAYER_RETURNED");
+    assert.strictEqual((lastLog.payload as { sessionId: string }).sessionId, "p3");
+  });
+
+  it("clearMissing is a no-op when the player was never missing", () => {
+    const { engine } = startNight();
+    assert.strictEqual(engine.clearMissing("p3"), false);
+    assert.strictEqual(engine.getMissingPlayers().length, 0);
+  });
+
+  it("declareDead requires host", () => {
+    const { engine } = startNight();
+    engine.pauseForMissing("p3");
+    assert.throws(() => engine.declareDead("p0", "p3"), (err: unknown) => {
+      return (err as { code: string }).code === EngineErrorCode.NOT_HOST;
+    });
+  });
+
+  it("declareDead rejects a player who is not missing", () => {
+    const { engine } = startNight();
+    assert.throws(() => engine.declareDead("host", "p3"), (err: unknown) => {
+      return (err as { code: string }).code === EngineErrorCode.WRONG_ROLE;
+    });
+  });
+
+  it("declareDead rejects a player not at the table", () => {
+    const { engine } = startNight();
+    // Pause for a known missing player first so the missing-set check passes
+    // and the engine falls through to the table check.
+    engine.pauseForMissing("p3");
+    // Remove them from the schema (e.g. onLeave fired first in some edge case).
+    engine.state.players.delete("p3");
+
+    assert.throws(() => engine.declareDead("host", "p3"), (err: unknown) => {
+      return (err as { code: string }).code === EngineErrorCode.PLAYER_MISSING;
+    });
+  });
+
+  it("declareDead marks the missing player dead and fires onPlayerDied with DECLARED_DEAD", () => {
+    const { engine, state } = startNight();
+    engine.pauseForMissing("p3");
+
+    let deadId = "";
+    let cause: string = "";
+    engine.setOnPlayerDied((id, c) => {
+      deadId = id;
+      cause = c;
+    });
+
+    engine.declareDead("host", "p3");
+
+    assert.strictEqual(state.players.get("p3")!.isAlive, false, "schema isAlive = false");
+    assert.strictEqual(state.players.get("p3")!.isMissing, false, "isMissing cleared");
+    assert.strictEqual(deadId, "p3");
+    assert.strictEqual(cause, "DECLARED_DEAD", "seam fired with DECLARED_DEAD cause");
+  });
+
+  it("declareDead resumes the MAFIA_WINDOW into a fresh 60s nudge cycle", () => {
+    const { engine } = startNight();
+    engine.pauseForMissing("p3");
+    assert.strictEqual(engine.getPhaseTimer()!.paused, true);
+
+    engine.declareDead("host", "p3");
+
+    const snap = engine.getPhaseTimer();
+    assert.ok(snap, "timer re-armed after declareDead");
+    assert.strictEqual(snap!.paused, false);
+    assert.strictEqual(snap!.mode, "MAFIA_WINDOW");
+    assert.strictEqual(snap!.remainingMs, 60_000, "fresh 60s window");
+  });
+
+  it("declareDead resumes a SPEECH_TURN timer from the pause point", () => {
+    const { engine, now } = startNight();
+    engine._assignRoleForTest("p3", Role.DOCTOR);
+    engine.mafiaKill("host", "p4");
+    engine.doctorHeal("p3", "p4");
+    engine.resolveNight();
+    engine.startSpeeches();
+    // Advance 20s, pause for missing, assert resume picks up where it left off.
+    now.value = 20_000;
+    engine.tickPhaseTimer();
+    const beforePause = engine.getPhaseTimer()!.remainingMs;
+    assert.strictEqual(beforePause, 40_000, "20s elapsed of 60s speech");
+
+    engine.pauseForMissing("p5");
+    assert.strictEqual(engine.getPhaseTimer()!.paused, true);
+
+    // Time keeps moving while paused — the pause point freezes elapsed, so
+    // resume should land at the same remainingMs as beforePause.
+    now.value = 25_000;
+    engine.declareDead("host", "p5");
+
+    const after = engine.getPhaseTimer();
+    assert.ok(after);
+    assert.strictEqual(after!.paused, false);
+    assert.strictEqual(after!.mode, "SPEECH_TURN");
+    assert.strictEqual(after!.remainingMs, beforePause, "resume picks up from pause point");
+  });
+
+  it("declareDead removes the player from the missing set so a later clearMissing is a no-op", () => {
+    const { engine } = startNight();
+    engine.pauseForMissing("p3");
+    engine.declareDead("host", "p3");
+    assert.strictEqual(engine.getMissingPlayers().length, 0);
+
+    assert.strictEqual(engine.clearMissing("p3"), false, "nothing left to clear");
+  });
+
+  it("declareDead emits a DEAD_DECLARED entry in the host action log with the actor", () => {
+    const { engine } = startNight();
+    engine.pauseForMissing("p3");
+    engine.declareDead("host", "p3");
+
+    const lastLog = engine.getActionLog().at(-1)!;
+    assert.strictEqual(lastLog.type, "DEAD_DECLARED");
+    assert.strictEqual(lastLog.actorSessionId, "host");
+    assert.strictEqual((lastLog.payload as { sessionId: string }).sessionId, "p3");
+  });
+
+  it("a declared-dead player cannot perform actions (requireAlivePlayer rejects)", () => {
+    const { engine, state } = startNight();
+    engine.pauseForMissing("p3");
+    engine.declareDead("host", "p3");
+    assert.strictEqual(state.players.get("p3")!.isAlive, false);
+
+    // Drive into DAY_VOTING where `vote` is the natural action — it already
+    // calls `requireAlivePlayer(actorSessionId)`, which is the same dead-guard
+    // any post-declareDead action will trip.
+    engine._assignRoleForTest("p3", Role.DOCTOR);
+    engine.mafiaKill("host", "p4");
+    engine.doctorHeal("p3", "p4");
+    engine.resolveNight();
+    engine.startSpeeches();
+    engine.nominate("p0", "p6");
+    while (engine.state.phase !== GamePhase.DAY_DEFENSE) engine.nextSpeaker();
+    while (engine.state.phase !== GamePhase.DAY_VOTING) engine.nextDefense();
+    assert.strictEqual(engine.state.phase, GamePhase.DAY_VOTING);
+
+    assert.throws(() => engine.vote("p3", "p6"), (err: unknown) => {
+      return (err as { code: string }).code === EngineErrorCode.PLAYER_DEAD;
+    });
+  });
+
+  it("declareDead fires the seam BEFORE resuming the timer (so victory checks see post-death state)", () => {
+    const { engine, state } = startNight();
+    engine.pauseForMissing("p3");
+
+    let aliveAtSeamFire: boolean | undefined;
+    let timerPausedAtSeamFire: boolean | undefined;
+    engine.setOnPlayerDied(() => {
+      aliveAtSeamFire = state.players.get("p3")!.isAlive;
+      timerPausedAtSeamFire = engine.getPhaseTimer()!.paused;
+    });
+
+    engine.declareDead("host", "p3");
+
+    assert.strictEqual(aliveAtSeamFire, false, "isAlive was already cleared at seam time");
+    assert.strictEqual(timerPausedAtSeamFire, true, "timer was still paused at seam time");
+  });
+
+  it("clearMissing on a non-paused timer is a no-op (do not re-arm an already-running window)", () => {
+    // Start night, no one is missing, no timer is paused — clearMissing
+    // must not affect the running MAFIA_WINDOW.
+    const { engine } = startNight();
+    const snapBefore = engine.getPhaseTimer();
+    assert.ok(snapBefore && !snapBefore.paused);
+
+    assert.strictEqual(engine.clearMissing("nobody"), false);
+    const snapAfter = engine.getPhaseTimer();
+    assert.strictEqual(snapAfter!.remainingMs, snapBefore!.remainingMs);
+  });
+
+  it("full disconnect-then-declareDead flow during DAY_VOTING (no timer) just marks dead", () => {
+    // A drop in DAY_VOTING has no timer to pause/resume, but the dead flag
+    // still flips and the seam still fires.
+    const { engine, state } = inDay1Voting();
+    const before = engine.getPhaseTimer();
+    assert.strictEqual(before, null, "no timer in DAY_VOTING");
+
+    let fired = false;
+    engine.setOnPlayerDied((id, cause) => {
+      fired = true;
+      assert.strictEqual(id, "p3");
+      assert.strictEqual(cause, "DECLARED_DEAD");
+    });
+
+    engine.pauseForMissing("p3");
+    engine.declareDead("host", "p3");
+
+    assert.strictEqual(state.players.get("p3")!.isAlive, false);
+    assert.strictEqual(fired, true);
+    assert.strictEqual(engine.getPhaseTimer(), null, "no timer was armed");
+  });
+});
