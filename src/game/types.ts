@@ -1,7 +1,7 @@
 import { GamePhase, Role, NightStep, Team } from "../rooms/schema/enums.js";
-import type { PhaseTimerMode } from "./PhaseTimer.js";
 
-export { PhaseTimer, PhaseTimerMode, PhaseTimerEvent, PhaseTimerSnapshot } from "./PhaseTimer.js";
+import type { PhaseTimerMode } from "./PhaseTimer.js";
+export type { PhaseTimerMode, PhaseTimerEvent, PhaseTimerSnapshot } from "./PhaseTimer.js";
 
 /**
  * Default durations and reminder marks (seconds elapsed) for each phase timer

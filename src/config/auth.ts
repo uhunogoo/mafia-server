@@ -54,7 +54,9 @@ export class Auth {
   }
 
   onDrop(client: Client) {
-    this.room.allowReconnection(client, this.RECONNECTION_TIMEOUT);
+    if (this.room.clients.includes(client)) {
+      this.room.allowReconnection(client, this.RECONNECTION_TIMEOUT);
+    }
   }
 
   onLeave(client: Client) {
