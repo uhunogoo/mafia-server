@@ -587,4 +587,174 @@ describe("mafia_room", () => {
 
     assert.ok(errors.length > 0, "vote for a non-nominated player must error");
   });
+
+  // ─── Ticket 04: phase timers + host overrides ─────────────────────────
+
+  it("startGame arms the mafia-window timer (60s) in the engine", async () => {
+    const { room } = await setupRoom(colyseus, 10);
+    const snap = room.engine.getPhaseTimer();
+    assert.ok(snap, "a phase timer should be active right after startGame");
+    assert.strictEqual(snap!.mode, "MAFIA_WINDOW");
+    assert.strictEqual(snap!.durationMs, 60_000);
+    assert.strictEqual(snap!.paused, false);
+  });
+
+  it("startSpeeches arms a 60s SPEECH_TURN timer; resolveVoting re-arms the MAFIA_WINDOW", async () => {
+    const setup = await setupRoom(colyseus, 10);
+
+    setup.host.send("mafiaKill", { targetId: setup.guests[5].sessionId });
+    await setup.room.waitForNextPatch();
+    setup.guests[3].send("doctorHeal", { targetId: setup.guests[5].sessionId });
+    await setup.room.waitForNextPatch();
+    setup.host.send("resolveNight");
+    await setup.room.waitForNextPatch();
+    setup.host.send("startSpeeches");
+    await setup.room.waitForNextPatch();
+
+    const speechSnap = setup.room.engine.getPhaseTimer();
+    assert.strictEqual(speechSnap?.mode, "SPEECH_TURN");
+    assert.strictEqual(speechSnap?.durationMs, 60_000);
+
+    // Nominate someone so DAY_DEFENSE has at least one candidate; otherwise
+    // resolveVoting would be rejected for being called outside DAY_VOTING.
+    setup.guests[0].send("nominate", { targetId: setup.guests[6].sessionId });
+    await setup.room.waitForNextPatch();
+
+    // Drive through all speeches.
+    const speakingOrderLength = setup.room.engine.getSpeakingOrder().length;
+    for (let i = 0; i < speakingOrderLength; i++) {
+      setup.host.send("nextSpeaker");
+      await setup.room.waitForNextPatch();
+    }
+    // Drive through all defenders (now at least one).
+    const defenseOrderLength = setup.room.engine.getDefenseOrder().length;
+    for (let i = 0; i < defenseOrderLength; i++) {
+      setup.host.send("nextDefense");
+      await setup.room.waitForNextPatch();
+    }
+    setup.host.send("resolveVoting");
+    await setup.room.waitForNextPatch();
+
+    // After resolveVoting we are in NIGHT step MAFIA — a fresh MAFIA_WINDOW
+    // timer should be armed.
+    const nightSnap = setup.room.engine.getPhaseTimer();
+    assert.ok(nightSnap, "MAFIA_WINDOW timer should be armed after resolveVoting");
+    assert.strictEqual(nightSnap!.mode, "MAFIA_WINDOW");
+    assert.strictEqual(nightSnap!.durationMs, 60_000);
+  });
+
+  it("host can pausePhase → resumePhase → the timer's paused flag flips", async () => {
+    const { room, host } = await setupRoom(colyseus, 10);
+    assert.strictEqual(room.engine.getPhaseTimer()!.paused, false);
+
+    host.send("pausePhase");
+    await room.waitForNextPatch();
+    assert.strictEqual(room.engine.getPhaseTimer()!.paused, true);
+
+    host.send("resumePhase");
+    await room.waitForNextPatch();
+    assert.strictEqual(room.engine.getPhaseTimer()!.paused, false);
+  });
+
+  it("host can extendPhase{seconds: 30} and the timer's total duration grows by 30s", async () => {
+    const { room, host } = await setupRoom(colyseus, 10);
+    const before = room.engine.getPhaseTimer()!.durationMs;
+    host.send("extendPhase", { seconds: 30 });
+    await room.waitForNextPatch();
+    const after = room.engine.getPhaseTimer()!.durationMs;
+    // `durationMs` is the timer's configured total; `extend` modifies it
+    // directly, so it's not subject to setInterval wall-clock drift between
+    // the before/after snapshots the way `remainingMs` is.
+    assert.strictEqual(
+      after - before,
+      30_000,
+      `extend should grow durationMs by exactly 30s; got before=${before} after=${after}`,
+    );
+    // The remaining time also should not have shrunk below the original
+    // duration (i.e. the host's 30s extension was applied).
+    assert.ok(
+      room.engine.getPhaseTimer()!.remainingMs >= before,
+      `remainingMs should be >= the original duration after extend; ` +
+        `got remainingMs=${room.engine.getPhaseTimer()!.remainingMs} originalDuration=${before}`,
+    );
+  });
+
+  it("host can skipPhase during DAY_SPEECHES and the speech cursor advances", async () => {
+    const setup = await setupRoom(colyseus, 10);
+    setup.host.send("mafiaKill", { targetId: setup.guests[5].sessionId });
+    await setup.room.waitForNextPatch();
+    setup.guests[3].send("doctorHeal", { targetId: setup.guests[5].sessionId });
+    await setup.room.waitForNextPatch();
+    setup.host.send("resolveNight");
+    await setup.room.waitForNextPatch();
+    setup.host.send("startSpeeches");
+    await setup.room.waitForNextPatch();
+
+    const first = setup.room.engine.getCurrentSpeaker();
+    setup.host.send("skipPhase");
+    await setup.room.waitForNextPatch();
+    assert.notStrictEqual(setup.room.engine.getCurrentSpeaker(), first);
+    assert.strictEqual(setup.room.engine.getPhaseTimer()!.mode, "SPEECH_TURN");
+  });
+
+  it("non-host is rejected for pausePhase / resumePhase / skipPhase / extendPhase", async () => {
+    const { room, guests } = await setupRoom(colyseus, 10);
+
+    const errors: string[] = [];
+    guests[0].onMessage("error", (msg: unknown) => {
+      errors.push(String((msg as { message?: string }).message ?? msg));
+    });
+
+    guests[0].send("pausePhase");
+    await room.waitForNextPatch();
+    guests[0].send("resumePhase");
+    await room.waitForNextPatch();
+    guests[0].send("skipPhase");
+    await room.waitForNextPatch();
+    guests[0].send("extendPhase", { seconds: 30 });
+    await room.waitForNextPatch();
+
+    assert.ok(errors.length >= 4, `non-host should be rejected for all four overrides, got ${errors.length}`);
+    assert.strictEqual(room.engine.getPhaseTimer()!.paused, false, "no state change from rejected pause");
+  });
+
+  it("mafia-window reminder at 30s elapsed is routed to the host", async () => {
+    const { room, host } = await setupRoom(colyseus, 10);
+
+    const reminders: unknown[] = [];
+    host.onMessage("timerReminder", (payload: unknown) => reminders.push(payload));
+
+    // Drive the room's timer driver with a fake-now delta of 30s. The room
+    // temporarily swaps the engine's clock, ticks once, and restores the
+    // real-time clock on exit. The engine fires a REMINDER event for the
+    // mafia window's 30s mark; the room forwards it to the host.
+    (room as unknown as { _driveTimerAtForTest(deltaMs: number): unknown[] })._driveTimerAtForTest(30_000);
+    // Allow the SDK to deliver the message.
+    await new Promise((r) => setTimeout(r, 50));
+
+    assert.strictEqual(reminders.length, 1, `host should receive exactly one reminder, got ${reminders.length}`);
+    const payload = reminders[0] as { mode: string; remainingSeconds: number };
+    assert.strictEqual(payload.mode, "MAFIA_WINDOW");
+    assert.strictEqual(payload.remainingSeconds, 30);
+  });
+
+  it("mafia-window reminders fire at both 30s and 50s elapsed", async () => {
+    const { room, host } = await setupRoom(colyseus, 10);
+
+    const reminders: Array<{ mode: string; remainingSeconds: number }> = [];
+    host.onMessage("timerReminder", (payload: unknown) =>
+      reminders.push(payload as { mode: string; remainingSeconds: number }),
+    );
+
+    // Drive the timer 50s past wall-clock — both the 30s and 50s marks
+    // should fire in the same tick.
+    (room as unknown as { _driveTimerAtForTest(deltaMs: number): unknown[] })._driveTimerAtForTest(50_000);
+    await new Promise((r) => setTimeout(r, 50));
+
+    assert.strictEqual(reminders.length, 2);
+    assert.strictEqual(reminders[0].mode, "MAFIA_WINDOW");
+    assert.strictEqual(reminders[0].remainingSeconds, 30);
+    assert.strictEqual(reminders[1].mode, "MAFIA_WINDOW");
+    assert.strictEqual(reminders[1].remainingSeconds, 10);
+  });
 });

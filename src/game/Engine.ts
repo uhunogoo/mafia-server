@@ -1,8 +1,10 @@
 import { MafiaState } from "../rooms/schema/MafiaState.js";
 import { GamePhase, NightStep, Role, Team } from "../rooms/schema/enums.js";
+import { PhaseTimer, type PhaseTimerEvent, type PhaseTimerMode, type PhaseTimerSnapshot } from "./PhaseTimer.js";
 import {
   ActionLogEntry,
   ActionType,
+  DEFAULT_TIMER_DURATIONS,
   DeathCause,
   EngineError,
   EngineErrorCode,
@@ -59,6 +61,16 @@ function shuffle<T>(items: readonly T[]): T[] {
  *    defense, and voting (skipping BALAGAN for Day 1 per ADR 0005)
  *  - resolveVoting tallies with default vote = last speaker, marks the loser
  *    dead, fires the onPlayerDied seam, and transitions DAY_VOTING → NIGHT
+ *
+ * Slice-4 (ticket 04) adds phase timers + host overrides:
+ *  - startGame / startSpeeches / nextSpeaker / enterDayDefense / nextDefense /
+ *    mafiaKill / resolveNight arm or clear the appropriate `PhaseTimer`
+ *  - tickPhaseTimer advances the active timer and dispatches EXPIRED events
+ *    to the right transition (nextSpeaker, nextDefense, or "pause" for the
+ *    mafia window)
+ *  - pausePhase / resumePhase / skipPhase / extendPhase let the host override
+ *    the timer (skip on a per-turn phase calls the same internal transition
+ *    that timer expiry would)
  *
  * The engine never touches the network; the room translates `EngineError`
  * into player-visible messages and `client.send` for private role reveals.
@@ -146,7 +158,23 @@ export class Engine {
 
   private nextEntryId = 0;
 
-  constructor(public readonly state: MafiaState) {}
+  /**
+   * Active server-side timer for the current phase. `null` when the phase has
+   * no timer (LOBBY, GAME_OVER, DAY_ANNOUNCEMENT, DAY_VOTING). The engine arms
+   * and clears this timer automatically as the phase machine progresses; the
+   * host's pause/resume/skip/extend overrides mutate it in place.
+   */
+  private phaseTimer: PhaseTimer | null = null;
+
+  /**
+   * Wall-clock provider. Tests inject a fake clock to advance time
+   * deterministically; production uses `Date.now`.
+   */
+  private clock: () => number;
+
+  constructor(public readonly state: MafiaState, clock?: () => number) {
+    this.clock = clock ?? (() => Date.now());
+  }
 
   // ─── Read accessors ─────────────────────────────────────────────────────
 
@@ -295,6 +323,9 @@ export class Engine {
     this.state.doctorTargetId = "";
     this.state.mafiaTargetId = "";
 
+    // Arm the 60s mafia window with 30s/50s host reminders.
+    this.startTimer("MAFIA_WINDOW");
+
     this.logEntry({
       actorSessionId: "",
       type: ActionType.PHASE_ADVANCE,
@@ -313,6 +344,8 @@ export class Engine {
 
     this.nightActions.mafiaVictimId = targetId;
     this.state.mafiaTargetId = targetId;
+    // Kill submitted — the mafia window is satisfied for this step.
+    this.clearTimer();
     this.logEntry({
       actorSessionId: hostSessionId,
       type: ActionType.MAFIA_KILL,
@@ -450,6 +483,8 @@ export class Engine {
     this.state.dayCount = this.state.dayCount + 1;
     this.resetDayState();
     this.state.phase = GamePhase.DAY_ANNOUNCEMENT;
+    // No timer in DAY_ANNOUNCEMENT; the host advances to DAY_SPEECHES.
+    this.clearTimer();
 
     return resolution;
   }
@@ -519,6 +554,14 @@ export class Engine {
     this.state.currentSpeakerId = this.getCurrentSpeaker();
     this.state.currentDefenseId = "";
 
+    // Arm the per-turn speech timer for the first speaker (or skip when no
+    // speakers remain — same as nextSpeaker's auto-transition path).
+    if (this.speakingOrder.length > 0) {
+      this.startTimer("SPEECH_TURN");
+    } else {
+      this.clearTimer();
+    }
+
     this.logEntry({
       actorSessionId: "",
       type: ActionType.PHASE_ADVANCE,
@@ -536,10 +579,14 @@ export class Engine {
 
     this.currentSpeakerIndex += 1;
     if (this.currentSpeakerIndex >= this.speakingOrder.length) {
+      // Defense begins with its own timer; enterDayDefense() arms it.
+      this.clearTimer();
       this.enterDayDefense();
       return;
     }
     this.state.currentSpeakerId = this.getCurrentSpeaker();
+    // Fresh 60s window for the new speaker.
+    this.startTimer("SPEECH_TURN");
   }
 
   /**
@@ -553,10 +600,14 @@ export class Engine {
 
     this.currentDefenseIndex += 1;
     if (this.currentDefenseIndex >= this.defenseOrder.length) {
+      // Voting has no timer; enterDayVoting() clears it.
+      this.clearTimer();
       this.enterDayVoting();
       return;
     }
     this.state.currentDefenseId = this.getCurrentDefense();
+    // Fresh 30s window for the next defender.
+    this.startTimer("DEFENSE_TURN");
   }
 
   /**
@@ -694,6 +745,8 @@ export class Engine {
 
     this.state.phase = GamePhase.NIGHT;
     this.state.nightStep = NightStep.MAFIA;
+    // Night begins with a fresh 60s mafia window.
+    this.startTimer("MAFIA_WINDOW");
 
     return resolution;
   }
@@ -868,6 +921,13 @@ export class Engine {
     this.state.phase = GamePhase.DAY_DEFENSE;
     this.state.currentSpeakerId = "";
     this.state.currentDefenseId = this.getCurrentDefense();
+    // Arm the per-turn defense timer for the first defender (skip when
+    // nobody was nominated — nextDefense() will auto-transition).
+    if (this.defenseOrder.length > 0) {
+      this.startTimer("DEFENSE_TURN");
+    } else {
+      this.clearTimer();
+    }
     this.logEntry({
       actorSessionId: "",
       type: ActionType.PHASE_ADVANCE,
@@ -883,6 +943,8 @@ export class Engine {
     this.votes.clear();
     this.state.phase = GamePhase.DAY_VOTING;
     this.state.currentDefenseId = "";
+    // Voting is resolved manually via resolveVoting; no auto-timer.
+    this.clearTimer();
     this.logEntry({
       actorSessionId: "",
       type: ActionType.PHASE_ADVANCE,
@@ -941,5 +1003,184 @@ export class Engine {
    */
   _setLastHealedForTest(doctorSessionId: string, targetId: string): void {
     this.lastHealed.set(doctorSessionId, targetId);
+  }
+
+  // ─── Phase timers + host overrides (ticket 04) ─────────────────────────
+
+  /** Wall-clock now, injectable for tests. */
+  private now(): number {
+    return this.clock();
+  }
+
+  /** Arm (or re-arm) the phase timer for `mode` with the default duration. */
+  private startTimer(mode: PhaseTimerMode): void {
+    const config = DEFAULT_TIMER_DURATIONS[mode];
+    this.phaseTimer = new PhaseTimer(mode, config.durationMs, config.reminders, this.now());
+  }
+
+  /** Clear the active phase timer. Called on phase exit and on host skip. */
+  private clearTimer(): void {
+    this.phaseTimer = null;
+  }
+
+  /**
+   * Snapshot of the active phase timer, or `null` when no timer is running.
+   * The room layer uses this for host-side display (e.g., "speech timer:
+   * 42s left"); tests use it to assert timer state without driving ticks.
+   */
+  getPhaseTimer(): PhaseTimerSnapshot | null {
+    if (!this.phaseTimer) return null;
+    return this.phaseTimer.snapshot(this.now());
+  }
+
+  /**
+   * Advance the active phase timer and dispatch any events. Called by the
+   * room layer on every wall-clock tick (~250ms). Returns the raw event list
+   * so the room can route REMINDERs to the host; the engine has already
+   * reacted to EXPIRED events internally (calling `nextSpeaker`,
+   * `nextDefense`, or pausing the mafia window).
+   */
+  tickPhaseTimer(): PhaseTimerEvent[] {
+    if (!this.phaseTimer) return [];
+    const events = this.phaseTimer.tick(this.now());
+    for (const event of events) {
+      if (event.type === "EXPIRED") {
+        this.onTimerExpired(event.mode);
+      }
+    }
+    return events;
+  }
+
+  /**
+   * React to a timer expiry. Dispatch by mode:
+   * - per-turn phases (SPEECH_TURN, DEFENSE_TURN) → call the matching advance,
+   *   which either restarts the timer (next turn) or auto-transitions to the
+   *   next phase (round complete).
+   * - BALAGAN → enter DAY_DEFENSE (no-op for Day 1; wired in ticket 07).
+   * - MAFIA_WINDOW → pause indefinitely per spec; resume re-arms a fresh
+   *   60s window so the host can keep nudging.
+   */
+  private onTimerExpired(mode: PhaseTimerMode): void {
+    switch (mode) {
+      case "SPEECH_TURN":
+        this.phaseTimer = null;
+        this.nextSpeaker();
+        break;
+      case "DEFENSE_TURN":
+        this.phaseTimer = null;
+        this.nextDefense();
+        break;
+      case "BALAGAN":
+        this.phaseTimer = null;
+        // Day 1 skips BALAGAN. Ticket 07 owns the entry/exit wiring.
+        break;
+      case "MAFIA_WINDOW":
+        // Spec: if no victim by the deadline, the phase pauses indefinitely.
+        // We transition the timer into paused state and keep it around so
+        // `resumePhase` can re-arm a fresh 60s window.
+        this.phaseTimer?.pause(this.now());
+        break;
+    }
+  }
+
+  // ─── Host overrides ──────────────────────────────────────────────────────
+
+  /**
+   * Host-only: pause the active phase timer. No-op if there is no timer or
+   * the timer is already paused.
+   */
+  pausePhase(hostSessionId: string): void {
+    this.requireHost(hostSessionId);
+    if (!this.phaseTimer || this.phaseTimer.isPaused()) return;
+    this.phaseTimer.pause(this.now());
+    this.logEntry({
+      actorSessionId: hostSessionId,
+      type: ActionType.PHASE_OVERRIDE,
+      payload: { event: "pause", mode: this.phaseTimer.mode },
+    });
+  }
+
+  /**
+   * Host-only: resume the active phase timer. No-op if there is no timer or
+   * the timer is not paused. After a MAFIA_WINDOW expiry, resume re-arms a
+   * fresh 60s window so the host gets another nudge cycle; for other modes
+   * the timer picks up from the pause point.
+   */
+  resumePhase(hostSessionId: string): void {
+    this.requireHost(hostSessionId);
+    if (!this.phaseTimer) return;
+    if (!this.phaseTimer.isPaused()) return;
+
+    if (this.phaseTimer.mode === "MAFIA_WINDOW") {
+      // Re-arm a fresh window. Per spec the host gets another full 60s to
+      // submit a victim; we don't continue counting from where we left off.
+      this.startTimer("MAFIA_WINDOW");
+    } else {
+      this.phaseTimer.resume(this.now());
+    }
+    this.logEntry({
+      actorSessionId: hostSessionId,
+      type: ActionType.PHASE_OVERRIDE,
+      payload: { event: "resume", mode: this.phaseTimer.mode },
+    });
+  }
+
+  /**
+   * Host-only: skip the current phase immediately. For per-turn phases this
+   * is equivalent to calling `nextSpeaker` / `nextDefense` once (which may
+   * cascade through the round). For MAFIA_WINDOW the spec offers no
+   * downstream phase to advance to inside NIGHT step MAFIA, so skip is a
+   * no-op.
+   */
+  skipPhase(hostSessionId: string): void {
+    this.requireHost(hostSessionId);
+    if (!this.phaseTimer) return;
+    const mode = this.phaseTimer.mode;
+    this.phaseTimer = null;
+
+    this.logEntry({
+      actorSessionId: hostSessionId,
+      type: ActionType.PHASE_OVERRIDE,
+      payload: { event: "skip", mode },
+    });
+
+    switch (mode) {
+      case "SPEECH_TURN":
+        this.nextSpeaker();
+        break;
+      case "DEFENSE_TURN":
+        this.nextDefense();
+        break;
+      case "MAFIA_WINDOW":
+      case "BALAGAN":
+        // No phase to jump to; the spec leaves the host without an
+        // explicit advance inside NIGHT step MAFIA / BALAGAN skip.
+        break;
+    }
+  }
+
+  /**
+   * Host-only: add `seconds` to the active phase timer. No-op when no timer
+   * is active. The added time is reflected in the next `getPhaseTimer()`
+   * snapshot.
+   */
+  extendPhase(hostSessionId: string, seconds: number): void {
+    this.requireHost(hostSessionId);
+    if (!this.phaseTimer) return;
+    if (!Number.isFinite(seconds) || seconds <= 0) return;
+    this.phaseTimer.extend(seconds);
+    this.logEntry({
+      actorSessionId: hostSessionId,
+      type: ActionType.PHASE_OVERRIDE,
+      payload: { event: "extend", mode: this.phaseTimer.mode, seconds },
+    });
+  }
+
+  /**
+   * Test-only: replace the wall-clock provider. Lets integration tests
+   * advance time deterministically without sleeping.
+   */
+  _setClockForTest(clock: () => number): void {
+    this.clock = clock;
   }
 }

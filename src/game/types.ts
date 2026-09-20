@@ -1,4 +1,30 @@
 import { GamePhase, Role, NightStep, Team } from "../rooms/schema/enums.js";
+import type { PhaseTimerMode } from "./PhaseTimer.js";
+
+export { PhaseTimer, PhaseTimerMode, PhaseTimerEvent, PhaseTimerSnapshot } from "./PhaseTimer.js";
+
+/**
+ * Default durations and reminder marks (seconds elapsed) for each phase timer
+ * mode. Centralized so the engine, the room, and the host UI all share one
+ * source of truth. Per ticket 04:
+ *
+ * - `MAFIA_WINDOW` — 60s with reminders at 30s and 50s elapsed (per
+ *   `CONTEXT.md` / spec). Expiry pauses the phase indefinitely (no auto-
+ *   advance; the host must submit a victim or hold the pause).
+ * - `SPEECH_TURN`  — 60s per speaker; the timer is restarted on every
+ *   `nextSpeaker` call so each speaker gets a fresh window.
+ * - `DEFENSE_TURN` — 30s per candidate; the timer is restarted on every
+ *   `nextDefense` call.
+ * - `BALAGAN`      — 90s (in the 1–2 minute range from the spec). Day 1 skips
+ *   BALAGAN; ticket 07 owns the entry/exit wiring. The mode is defined here
+ *   so ticket 07 can arm the timer by simply calling `startTimer("BALAGAN")`.
+ */
+export const DEFAULT_TIMER_DURATIONS: Record<PhaseTimerMode, { durationMs: number; reminders: readonly number[] }> = {
+  MAFIA_WINDOW: { durationMs: 60_000, reminders: [30, 50] },
+  SPEECH_TURN:  { durationMs: 60_000, reminders: [] },
+  DEFENSE_TURN: { durationMs: 30_000, reminders: [] },
+  BALAGAN:      { durationMs: 90_000, reminders: [60] },
+};
 
 /**
  * Canonical role distribution per player count. The list is the role pool;

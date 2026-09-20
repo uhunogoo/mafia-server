@@ -2,9 +2,11 @@ import { Room, Client } from "@colyseus/core";
 import { MafiaState } from "./schema/MafiaState.js";
 import { Auth } from "../config/auth.js";
 import { Engine } from "../game/Engine.js";
+import type { PhaseTimerEvent } from "../game/PhaseTimer.js";
 import { EngineError, EngineErrorCode, PingRecord } from "../game/types.js";
 
 const INVITE_TTL_MS = 1000 * 60 * 60 * 6;
+const PHASE_TIMER_TICK_MS = 250;
 
 export class MafiaRoom extends Room {
   maxClients = 12;
@@ -17,6 +19,13 @@ export class MafiaRoom extends Room {
 
   password: string | undefined;
   private inviteCreatedAt = 0;
+
+  /**
+   * Server-side timer driver. Calls `engine.tickPhaseTimer()` every
+   * `PHASE_TIMER_TICK_MS`; reminders are routed to the host. The handle is
+   * cleared on room dispose.
+   */
+  private phaseTimerHandle: ReturnType<typeof setInterval> | null = null;
 
   private auth = new Auth(this);
 
@@ -134,6 +143,27 @@ export class MafiaRoom extends Room {
       if (!this.requireHost(client)) return;
       this.runEngine(() => this.engine.resolveVoting(), client);
     },
+    pausePhase: (client: Client) => {
+      if (!this.requireHost(client)) return;
+      this.runEngine(() => this.engine.pausePhase(client.sessionId), client);
+    },
+    resumePhase: (client: Client) => {
+      if (!this.requireHost(client)) return;
+      this.runEngine(() => this.engine.resumePhase(client.sessionId), client);
+    },
+    skipPhase: (client: Client) => {
+      if (!this.requireHost(client)) return;
+      this.runEngine(() => this.engine.skipPhase(client.sessionId), client);
+    },
+    extendPhase: (client: Client, payload: { seconds: number }) => {
+      if (!this.requireHost(client)) return;
+      const seconds = Number(payload?.seconds);
+      if (!Number.isFinite(seconds) || seconds <= 0) {
+        this.fail(client, "seconds must be a positive number");
+        return;
+      }
+      this.runEngine(() => this.engine.extendPhase(client.sessionId, seconds), client);
+    },
     ping: (client: Client, payload: { toId: string }) => {
       if (typeof payload?.toId !== "string") {
         this.fail(client, "toId is required");
@@ -177,6 +207,11 @@ export class MafiaRoom extends Room {
     this.engine.setOnPlayerDied((_sessionId, _cause) => {
       // Intentionally empty for this ticket.
     });
+
+    // Start the phase-timer driver (ticket 04). Calls engine.tickPhaseTimer()
+    // on every interval; reminders are forwarded to the host. The handle is
+    // released in onDispose.
+    this.phaseTimerHandle = setInterval(() => this.drivePhaseTimer(), PHASE_TIMER_TICK_MS);
   }
 
   async onAuth(client: Client, options: { name?: string }) {
@@ -193,6 +228,13 @@ export class MafiaRoom extends Room {
 
   onLeave(client: Client) {
     this.auth.onLeave(client);
+  }
+
+  onDispose() {
+    if (this.phaseTimerHandle !== null) {
+      clearInterval(this.phaseTimerHandle);
+      this.phaseTimerHandle = null;
+    }
   }
 
   // ——— helpers ———
@@ -235,6 +277,26 @@ export class MafiaRoom extends Room {
     host.send("ping", record);
   }
 
+  /**
+   * Drive the engine's phase timer forward by one wall-clock tick. The
+   * engine reacts to EXPIRED events internally (calling nextSpeaker,
+   * nextDefense, or pausing the mafia window); the room only needs to route
+   * REMINDER events to the host so the UI can surface them. Called by the
+   * room's setInterval; also exposed for tests via `_tickPhaseTimerForTest`.
+   */
+  private drivePhaseTimer(events?: PhaseTimerEvent[]): void {
+    const result = events ?? this.engine.tickPhaseTimer();
+    for (const event of result) {
+      if (event.type === "REMINDER") {
+        const host = this.findHostClient();
+        host?.send("timerReminder", {
+          mode: event.mode,
+          remainingSeconds: event.remainingSeconds,
+        });
+      }
+    }
+  }
+
   private fail(client: Client, message: string) {
     client.send("error", message);
   }
@@ -271,5 +333,33 @@ export class MafiaRoom extends Room {
       }
     }
     return "Сталася помилка";
+  }
+
+  /**
+   * Test-only: drive the engine's phase-timer forward by one tick using the
+   * current room clock (real Date.now). Mirrors the setInterval callback.
+   */
+  _tickPhaseTimerForTest(): void {
+    this.drivePhaseTimer();
+  }
+
+  /**
+   * Test-only: drive the phase timer by `deltaMs` past the current wall
+   * clock. The room temporarily swaps the engine's clock to `Date.now() +
+   * deltaMs`, ticks once, and restores the real-time clock on exit. Use to
+   * assert that the room routes reminder/expired events to the host at the
+   * right elapsed-second marks without sleeping.
+   */
+  _driveTimerAtForTest(deltaMs: number): PhaseTimerEvent[] {
+    const original = (this.engine as unknown as { clock: () => number }).clock;
+    const baseTime = Date.now();
+    this.engine._setClockForTest(() => baseTime + deltaMs);
+    try {
+      const events = this.engine.tickPhaseTimer();
+      this.drivePhaseTimer(events);
+      return events;
+    } finally {
+      this.engine._setClockForTest(original);
+    }
   }
 }

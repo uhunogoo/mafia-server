@@ -2,6 +2,7 @@
 import { MafiaState, Player } from "../src/rooms/schema/MafiaState.js";
 import { GamePhase, NightStep, Role, Team } from "../src/rooms/schema/enums.js";
 import { Engine } from "../src/game/Engine.js";
+import { PhaseTimer } from "../src/game/PhaseTimer.js";
 import { EngineErrorCode } from "../src/game/types.js";
 
 /**
@@ -1060,5 +1061,465 @@ describe("Engine — resolveVoting", () => {
     assert.throws(() => engine.resolveVoting(), (err: unknown) => {
       return (err as { code: string }).code === EngineErrorCode.WRONG_PHASE;
     });
+  });
+});
+
+// ─── Ticket 04: Phase timers + host overrides ───────────────────────
+
+describe("PhaseTimer (pure)", () => {
+  it("starts with the given duration, unpaused, no elapsed time", () => {
+    const t = new PhaseTimer("MAFIA_WINDOW", 60_000, [30, 50], 0);
+    assert.strictEqual(t.isPaused(), false);
+    assert.strictEqual(t.remainingMs(0), 60_000);
+    assert.strictEqual(t.elapsedMs(0), 0);
+    assert.strictEqual(t.isExpired(0), false);
+  });
+
+  it("fires REMINDER events at the configured marks; remainingSeconds reflects time left at the mark", () => {
+    const t = new PhaseTimer("MAFIA_WINDOW", 60_000, [30, 50], 0);
+    const events = t.tick(30_000);
+    assert.strictEqual(events.length, 1);
+    assert.strictEqual(events[0].type, "REMINDER");
+    assert.strictEqual(events[0].mode, "MAFIA_WINDOW");
+    assert.strictEqual(events[0].remainingSeconds, 30, "30s mark → 30s remaining");
+  });
+
+  it("fires both reminders in a single tick that crosses both marks", () => {
+    const t = new PhaseTimer("MAFIA_WINDOW", 60_000, [30, 50], 0);
+    const events = t.tick(50_000);
+    assert.strictEqual(events.length, 2);
+    assert.deepStrictEqual(events.map((e) => e.type), ["REMINDER", "REMINDER"]);
+    assert.strictEqual((events[1] as { remainingSeconds: number }).remainingSeconds, 10);
+  });
+
+  it("fires EXPIRED when the timer crosses its duration; no further events fire after", () => {
+    const t = new PhaseTimer("MAFIA_WINDOW", 60_000, [30, 50], 0);
+    const events = t.tick(60_000);
+    // At t=60s, both reminders have already fired and the timer has crossed
+    // its 60s mark — 3 events in a single tick.
+    assert.strictEqual(events.length, 3);
+    assert.strictEqual(events[2].type, "EXPIRED");
+    assert.strictEqual(events[2].mode, "MAFIA_WINDOW");
+    assert.strictEqual(t.isExpired(60_000), true);
+
+    // Subsequent ticks produce no further events.
+    assert.deepStrictEqual(t.tick(120_000), []);
+  });
+
+  it("does not re-fire a reminder that has already fired (idempotent across ticks)", () => {
+    const t = new PhaseTimer("MAFIA_WINDOW", 60_000, [30, 50], 0);
+    const e1 = t.tick(30_000);
+    assert.strictEqual(e1.length, 1);
+    const e2 = t.tick(45_000);
+    assert.strictEqual(e2.length, 0, "no reminder before the 50s mark");
+    const e3 = t.tick(50_000);
+    assert.strictEqual(e3.length, 1);
+    assert.strictEqual(e3[0].type, "REMINDER");
+  });
+
+  it("pause freezes elapsed; resume continues counting from where it left off", () => {
+    const t = new PhaseTimer("SPEECH_TURN", 60_000, [], 0);
+    t.tick(20_000);
+    t.pause(20_000);
+    assert.strictEqual(t.isPaused(), true);
+    assert.strictEqual(t.elapsedMs(20_000), 20_000);
+    assert.strictEqual(t.remainingMs(20_000), 40_000);
+
+    // While paused, ticking does not advance elapsed.
+    t.tick(45_000);
+    assert.strictEqual(t.elapsedMs(45_000), 20_000);
+
+    // Resume picks up from the pause point.
+    t.resume(45_000);
+    assert.strictEqual(t.isPaused(), false);
+    t.tick(60_000); // 15s of new elapsed → total 35s
+    assert.strictEqual(t.elapsedMs(60_000), 35_000);
+    assert.strictEqual(t.remainingMs(60_000), 25_000);
+  });
+
+  it("extend adds seconds to the remaining duration", () => {
+    const t = new PhaseTimer("SPEECH_TURN", 60_000, [], 0);
+    t.tick(10_000);
+    t.extend(30);
+    assert.strictEqual(t.remainingMs(10_000), 80_000);
+    t.extend(15);
+    assert.strictEqual(t.remainingMs(10_000), 95_000);
+  });
+
+  it("extend works while paused", () => {
+    const t = new PhaseTimer("SPEECH_TURN", 60_000, [], 0);
+    t.tick(10_000);
+    t.pause(10_000);
+    t.extend(30);
+    assert.strictEqual(t.remainingMs(10_000), 80_000);
+  });
+
+  it("snapshot exposes the current mode, duration, remaining time, paused state", () => {
+    const t = new PhaseTimer("DEFENSE_TURN", 30_000, [], 0);
+    t.tick(5_000);
+    t.pause(5_000);
+    const snap = t.snapshot();
+    assert.strictEqual(snap.mode, "DEFENSE_TURN");
+    assert.strictEqual(snap.durationMs, 30_000);
+    assert.strictEqual(snap.remainingMs, 25_000);
+    assert.strictEqual(snap.paused, true);
+  });
+
+  it("a no-time tick returns no events", () => {
+    const t = new PhaseTimer("SPEECH_TURN", 60_000, [], 0);
+    assert.deepStrictEqual(t.tick(0), []);
+  });
+});
+
+describe("Engine — phase-timer lifecycle", () => {
+  /** Build an engine with a fake clock so tests can advance time deterministically. */
+  function withFakeClock(): { state: MafiaState; engine: Engine; now: { value: number } } {
+    const state = freshState(10);
+    const now = { value: 0 };
+    const engine = new Engine(state, () => now.value);
+    return { state, engine, now };
+  }
+
+  it("startGame arms the MAFIA_WINDOW timer with 60s and 30s/50s reminders", () => {
+    const { engine, now } = withFakeClock();
+    engine.startGame();
+    const snap = engine.getPhaseTimer();
+    assert.ok(snap, "mafia window timer should be active");
+    assert.strictEqual(snap!.mode, "MAFIA_WINDOW");
+    assert.strictEqual(snap!.durationMs, 60_000);
+    assert.strictEqual(snap!.remainingMs, 60_000);
+    assert.strictEqual(snap!.paused, false);
+
+    now.value = 30_000;
+    const events = engine.tickPhaseTimer();
+    const reminders = events.filter((e) => e.type === "REMINDER");
+    assert.strictEqual(reminders.length, 1);
+    assert.strictEqual(reminders[0].mode, "MAFIA_WINDOW");
+    assert.strictEqual(reminders[0].remainingSeconds, 30);
+  });
+
+  it("mafiaKill clears the MAFIA_WINDOW timer", () => {
+    const { engine } = withFakeClock();
+    engine.startGame();
+    engine._assignRoleForTest("p3", Role.DOCTOR);
+    assert.ok(engine.getPhaseTimer(), "timer started by startGame");
+    engine.mafiaKill("host", "p4");
+    assert.strictEqual(engine.getPhaseTimer(), null, "timer cleared once a victim is submitted");
+  });
+
+  it("resolveNight clears the timer", () => {
+    const { engine } = withFakeClock();
+    engine.startGame();
+    engine._assignRoleForTest("p3", Role.DOCTOR);
+    engine.mafiaKill("host", "p4");
+    engine.doctorHeal("p3", "p4");
+    engine.resolveNight();
+    assert.strictEqual(engine.getPhaseTimer(), null, "no timer in DAY_ANNOUNCEMENT");
+  });
+
+  it("startSpeeches arms a 60s SPEECH_TURN timer", () => {
+    const { engine } = withFakeClock();
+    engine.startGame();
+    engine._assignRoleForTest("p3", Role.DOCTOR);
+    engine.mafiaKill("host", "p4");
+    engine.doctorHeal("p3", "p4");
+    engine.resolveNight();
+    engine.startSpeeches();
+
+    const snap = engine.getPhaseTimer();
+    assert.ok(snap);
+    assert.strictEqual(snap!.mode, "SPEECH_TURN");
+    assert.strictEqual(snap!.durationMs, 60_000);
+  });
+
+  it("nextSpeaker restarts the SPEECH_TURN timer for the next speaker", () => {
+    const { engine, now } = withFakeClock();
+    engine.startGame();
+    engine._assignRoleForTest("p3", Role.DOCTOR);
+    engine.mafiaKill("host", "p4");
+    engine.doctorHeal("p3", "p4");
+    engine.resolveNight();
+    engine.startSpeeches();
+    // Burn 30s of the first speaker's window.
+    now.value = 30_000;
+    engine.tickPhaseTimer();
+    // Advance to the next speaker — timer should restart fresh.
+    engine.nextSpeaker();
+    const snap = engine.getPhaseTimer();
+    assert.strictEqual(snap!.mode, "SPEECH_TURN");
+    assert.strictEqual(snap!.remainingMs, 60_000, "next speaker gets a fresh 60s window");
+  });
+
+  it("nextSpeaker clears the timer when it auto-transitions to DAY_DEFENSE", () => {
+    const { engine } = withFakeClock();
+    engine.startGame();
+    engine._assignRoleForTest("p3", Role.DOCTOR);
+    engine.mafiaKill("host", "p4");
+    engine.doctorHeal("p3", "p4");
+    engine.resolveNight();
+    engine.startSpeeches();
+    // Nominate someone so the defense order is non-empty and the defense
+    // timer arms on entry.
+    engine.nominate("p0", "p6");
+    // Drive through every speaker — the last nextSpeaker auto-transitions.
+    for (let i = 0; i < 10; i++) engine.nextSpeaker();
+    // Defense begins with its own timer; not cleared. Just verify mode flipped.
+    const snap = engine.getPhaseTimer();
+    assert.ok(snap, "DEFENSE timer armed on entry");
+    assert.strictEqual(snap!.mode, "DEFENSE_TURN");
+  });
+
+  it("enterDayDefense arms a 30s DEFENSE_TURN timer", () => {
+    const { engine } = withFakeClock();
+    engine.startGame();
+    engine._assignRoleForTest("p3", Role.DOCTOR);
+    engine.mafiaKill("host", "p4");
+    engine.doctorHeal("p3", "p4");
+    engine.resolveNight();
+    engine.startSpeeches();
+    engine.nominate("p0", "p6");
+    engine.nextSpeaker(); // → DAY_DEFENSE via cascade (only 10 speakers; on last call)
+    // Drive all the way through to DAY_DEFENSE explicitly:
+    while (engine.state.phase !== GamePhase.DAY_DEFENSE) engine.nextSpeaker();
+
+    const snap = engine.getPhaseTimer();
+    assert.strictEqual(snap!.mode, "DEFENSE_TURN");
+    assert.strictEqual(snap!.durationMs, 30_000);
+  });
+
+  it("nextDefense restarts the DEFENSE_TURN timer for the next candidate", () => {
+    const { engine, now } = withFakeClock();
+    engine.startGame();
+    engine._assignRoleForTest("p3", Role.DOCTOR);
+    engine.mafiaKill("host", "p4");
+    engine.doctorHeal("p3", "p4");
+    engine.resolveNight();
+    engine.startSpeeches();
+    engine.nominate("p0", "p6");
+    engine.nominate("p1", "p8");
+    while (engine.state.phase !== GamePhase.DAY_DEFENSE) engine.nextSpeaker();
+
+    // Burn 15s of the first defender's window.
+    now.value = 15_000;
+    engine.tickPhaseTimer();
+    engine.nextDefense();
+    const snap = engine.getPhaseTimer();
+    assert.strictEqual(snap!.mode, "DEFENSE_TURN");
+    assert.strictEqual(snap!.remainingMs, 30_000, "next defender gets a fresh 30s window");
+  });
+
+  it("DAY_VOTING has no timer", () => {
+    const { engine } = withFakeClock();
+    engine.startGame();
+    engine._assignRoleForTest("p3", Role.DOCTOR);
+    engine.mafiaKill("host", "p4");
+    engine.doctorHeal("p3", "p4");
+    engine.resolveNight();
+    engine.startSpeeches();
+    engine.nominate("p0", "p6");
+    while (engine.state.phase !== GamePhase.DAY_DEFENSE) engine.nextSpeaker();
+    while (engine.state.phase !== GamePhase.DAY_VOTING) engine.nextDefense();
+    assert.strictEqual(engine.getPhaseTimer(), null, "no timer in DAY_VOTING");
+  });
+});
+
+describe("Engine — phase-timer expiry reactions", () => {
+  /** Drive the engine through the night + day-1 speech round, returning the
+   * engine positioned at DAY_SPEECHES with a SPEECH_TURN timer armed. */
+  function inDay1Speeches(): { state: MafiaState; engine: Engine; now: { value: number } } {
+    const state = freshState(10);
+    const now = { value: 0 };
+    const engine = new Engine(state, () => now.value);
+    engine.startGame();
+    engine._assignRoleForTest("p3", Role.DOCTOR);
+    engine.mafiaKill("host", "p4");
+    engine.doctorHeal("p3", "p4");
+    engine.resolveNight();
+    engine.startSpeeches();
+    return { state, engine, now };
+  }
+
+  it("SPEECH_TURN expiry auto-advances to the next speaker via nextSpeaker", () => {
+    const { engine, now } = inDay1Speeches();
+    const first = engine.getCurrentSpeaker();
+    now.value = 60_000;
+    const events = engine.tickPhaseTimer();
+    assert.ok(events.some((e) => e.type === "EXPIRED" && e.mode === "SPEECH_TURN"));
+    assert.notStrictEqual(engine.getCurrentSpeaker(), first, "speaker advanced after expiry");
+    assert.strictEqual(engine.getPhaseTimer()!.mode, "SPEECH_TURN", "new speaker gets a fresh timer");
+  });
+
+  it("SPEECH_TURN expiry cascades through the round and into DAY_DEFENSE", () => {
+    const { engine, now } = inDay1Speeches();
+    // Nominate someone so the defense order is non-empty and the defense
+    // timer arms when the round auto-transitions.
+    engine.nominate("p0", "p6");
+    // Each tick fires one EXPIRED (one transition). The room's setInterval
+    // drives ticks every 250ms in production; here we drive 10 ticks at
+    // 60s+1ms intervals to simulate the cascading through all speakers.
+    for (let i = 0; i < 10; i++) {
+      now.value = (i + 1) * 60_000 + 1;
+      engine.tickPhaseTimer();
+    }
+    // After 10 ticks, every speaker has advanced; the engine should be in
+    // DAY_DEFENSE with the per-turn defense timer armed.
+    assert.strictEqual(engine.state.phase, GamePhase.DAY_DEFENSE);
+    assert.strictEqual(engine.getPhaseTimer()!.mode, "DEFENSE_TURN");
+  });
+
+  it("MAFIA_WINDOW expiry pauses the phase (does NOT auto-advance)", () => {
+    const state = freshState(10);
+    const now = { value: 0 };
+    const engine = new Engine(state, () => now.value);
+    engine.startGame();
+
+    now.value = 60_000;
+    const events = engine.tickPhaseTimer();
+    assert.ok(events.some((e) => e.type === "EXPIRED" && e.mode === "MAFIA_WINDOW"));
+
+    const snap = engine.getPhaseTimer();
+    assert.ok(snap, "timer is kept around in paused state");
+    assert.strictEqual(snap!.paused, true, "mafia window expired into paused");
+    assert.strictEqual(engine.state.phase, GamePhase.NIGHT, "phase did not auto-advance");
+    assert.strictEqual(engine.state.nightStep, NightStep.MAFIA);
+  });
+});
+
+describe("Engine — host phase overrides", () => {
+  function startNight(): { state: MafiaState; engine: Engine; now: { value: number } } {
+    const state = freshState(10);
+    const now = { value: 0 };
+    const engine = new Engine(state, () => now.value);
+    engine.startGame();
+    return { state, engine, now };
+  }
+
+  function startDay1Speeches(): { state: MafiaState; engine: Engine; now: { value: number } } {
+    const { state } = startNight();
+    const now = { value: 0 };
+    const engine = new Engine(state, () => now.value);
+    // startNight() already called startGame on the first engine — rebuild on
+    // a fresh engine so the helper below can drive a full day-1 cycle.
+    engine._assignRoleForTest("p3", Role.DOCTOR);
+    engine.mafiaKill("host", "p4");
+    engine.doctorHeal("p3", "p4");
+    engine.resolveNight();
+    engine.startSpeeches();
+    return { state, engine, now };
+  }
+
+  it("pausePhase marks the active timer as paused and logs a PHASE_OVERRIDE entry", () => {
+    const { engine, now } = startNight();
+    now.value = 10_000;
+    engine.pausePhase("host");
+    const snap = engine.getPhaseTimer();
+    assert.strictEqual(snap!.paused, true);
+
+    const lastLog = engine.getActionLog().at(-1)!;
+    assert.strictEqual(lastLog.type, "PHASE_OVERRIDE");
+    assert.strictEqual((lastLog.payload as { event: string }).event, "pause");
+  });
+
+  it("resumePhase unpauses; resume after mafia-window expiry re-arms a fresh window", () => {
+    const { engine, now } = startNight();
+    now.value = 60_000;
+    engine.tickPhaseTimer(); // expired into paused
+    assert.strictEqual(engine.getPhaseTimer()!.paused, true);
+
+    now.value = 60_500;
+    engine.resumePhase("host");
+    const snap = engine.getPhaseTimer();
+    assert.strictEqual(snap!.paused, false);
+    assert.strictEqual(snap!.mode, "MAFIA_WINDOW");
+    assert.strictEqual(snap!.remainingMs, 60_000, "fresh 60s window after resume");
+  });
+
+  it("resumePhase is a no-op when there is no timer", () => {
+    const { engine } = startNight();
+    // Resolve the night so the mafia window timer clears.
+    engine._assignRoleForTest("p3", Role.DOCTOR);
+    engine.mafiaKill("host", "p4");
+    engine.doctorHeal("p3", "p4");
+    engine.resolveNight();
+    assert.strictEqual(engine.getPhaseTimer(), null);
+    engine.resumePhase("host"); // does not throw
+    assert.strictEqual(engine.getPhaseTimer(), null);
+  });
+
+  it("skipPhase on SPEECH_TURN advances to the next speaker (same as nextSpeaker)", () => {
+    const { engine } = startDay1Speeches();
+    const first = engine.getCurrentSpeaker();
+    engine.skipPhase("host");
+    assert.notStrictEqual(engine.getCurrentSpeaker(), first);
+    assert.strictEqual(engine.getPhaseTimer()!.mode, "SPEECH_TURN");
+
+    const lastLog = engine.getActionLog().at(-1)!;
+    assert.strictEqual(lastLog.type, "PHASE_OVERRIDE");
+    assert.strictEqual((lastLog.payload as { event: string }).event, "skip");
+  });
+
+  it("skipPhase on DEFENSE_TURN advances to the next defender", () => {
+    const { engine } = startDay1Speeches();
+    engine.nominate("p0", "p6");
+    engine.nominate("p1", "p8");
+    while (engine.state.phase !== GamePhase.DAY_DEFENSE) engine.nextSpeaker();
+    const first = engine.getCurrentDefense();
+    engine.skipPhase("host");
+    assert.notStrictEqual(engine.getCurrentDefense(), first);
+    assert.strictEqual(engine.getPhaseTimer()!.mode, "DEFENSE_TURN");
+  });
+
+  it("skipPhase on MAFIA_WINDOW is a no-op (there's no phase to jump to inside NIGHT step MAFIA)", () => {
+    const { engine } = startNight();
+    engine.skipPhase("host");
+    assert.strictEqual(engine.state.phase, GamePhase.NIGHT);
+    assert.strictEqual(engine.state.nightStep, NightStep.MAFIA);
+  });
+
+  it("extendPhase adds N seconds to the active timer", () => {
+    const { engine, now } = startDay1Speeches();
+    now.value = 10_000;
+    engine.tickPhaseTimer();
+    const before = engine.getPhaseTimer()!.remainingMs;
+    engine.extendPhase("host", 30);
+    assert.strictEqual(engine.getPhaseTimer()!.remainingMs, before + 30_000);
+  });
+
+  it("extendPhase is a no-op when there is no active timer", () => {
+    const { engine } = startNight();
+    // No timer in DAY_ANNOUNCEMENT (we don't set one); but right now we're in
+    // NIGHT with a mafia window. After we submit a kill, no timer.
+    engine._assignRoleForTest("p3", Role.DOCTOR);
+    engine.mafiaKill("host", "p4");
+    engine.doctorHeal("p3", "p4");
+    engine.resolveNight();
+    assert.strictEqual(engine.getPhaseTimer(), null);
+    engine.extendPhase("host", 30); // does not throw
+    assert.strictEqual(engine.getPhaseTimer(), null);
+  });
+
+  it("pause / resume / skip / extend all reject a non-host actor", () => {
+    const { engine } = startNight();
+    assert.throws(() => engine.pausePhase("p0"), (err: unknown) => {
+      return (err as { code: string }).code === EngineErrorCode.NOT_HOST;
+    });
+    assert.throws(() => engine.resumePhase("p0"), (err: unknown) => {
+      return (err as { code: string }).code === EngineErrorCode.NOT_HOST;
+    });
+    assert.throws(() => engine.skipPhase("p0"), (err: unknown) => {
+      return (err as { code: string }).code === EngineErrorCode.NOT_HOST;
+    });
+    assert.throws(() => engine.extendPhase("p0", 10), (err: unknown) => {
+      return (err as { code: string }).code === EngineErrorCode.NOT_HOST;
+    });
+  });
+
+  it("tickPhaseTimer returns an empty array when no timer is active", () => {
+    const { engine } = startNight();
+    engine._assignRoleForTest("p3", Role.DOCTOR);
+    engine.mafiaKill("host", "p4");
+    engine.doctorHeal("p3", "p4");
+    engine.resolveNight();
+    assert.deepStrictEqual(engine.tickPhaseTimer(), []);
   });
 });
