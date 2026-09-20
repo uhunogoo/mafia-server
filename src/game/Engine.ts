@@ -6,12 +6,14 @@ import {
   ActionType,
   DEFAULT_TIMER_DURATIONS,
   DeathCause,
+  DonCheckResult,
   EngineError,
   EngineErrorCode,
   NightResolution,
   PingRecord,
   PlayerIdentity,
   ROLE_DISTRIBUTION,
+  SheriffCheckResult,
   SUPPORTED_PLAYER_COUNTS,
   VoteResolution,
 } from "./types.js";
@@ -414,11 +416,12 @@ export class Engine {
   }
 
   /**
-   * Stub for ticket 07b: the action is recorded and the engine would later
-   * resolve the "is Sheriff?" result privately. For now we only enforce that
-   * the caller is the Don, the target is alive, and the phase is NIGHT.
+   * Don picks a player to check. The result `{targetId, isSheriff}` is
+   * returned to the caller (the room layer routes it as a private message
+   * to the Don's session) — no other client or schema field reveals that the
+   * check happened. Ticket 07b.
    */
-  donCheck(actorSessionId: string, targetId: string): void {
+  donCheck(actorSessionId: string, targetId: string): DonCheckResult {
     this.requirePhase(GamePhase.NIGHT);
     this.requireRole(actorSessionId, Role.DON);
     this.requireAlivePlayer(actorSessionId);
@@ -429,6 +432,7 @@ export class Engine {
         "Don cannot check themselves",
       );
     }
+    const targetIdentity = this.requireCheckedTarget(targetId);
 
     this.nightActions.donCheck = { actorId: actorSessionId, targetId };
     this.logEntry({
@@ -436,12 +440,18 @@ export class Engine {
       type: ActionType.DON_CHECK,
       payload: { targetId },
     });
+
+    return { targetId, isSheriff: targetIdentity.role === Role.SHERIFF };
   }
 
   /**
-   * Stub for ticket 07b: recorded only, not yet resolved privately.
+   * Sheriff picks a player to check. The result `{targetId, team}` is
+   * returned to the caller; per spec the Don always reports as BLACK to the
+   * Sheriff (encoded explicitly even though the Don's canonical team is
+   * already BLACK — keeps the intent visible and survives future rule
+   * changes). Ticket 07b.
    */
-  sheriffCheck(actorSessionId: string, targetId: string): void {
+  sheriffCheck(actorSessionId: string, targetId: string): SheriffCheckResult {
     this.requirePhase(GamePhase.NIGHT);
     this.requireRole(actorSessionId, Role.SHERIFF);
     this.requireAlivePlayer(actorSessionId);
@@ -452,6 +462,7 @@ export class Engine {
         "Sheriff cannot check themselves",
       );
     }
+    const targetIdentity = this.requireCheckedTarget(targetId);
 
     this.nightActions.sheriffCheck = { actorId: actorSessionId, targetId };
     this.logEntry({
@@ -459,6 +470,30 @@ export class Engine {
       type: ActionType.SHERIFF_CHECK,
       payload: { targetId },
     });
+
+    const team =
+      targetIdentity.role === Role.DON ? Team.BLACK : targetIdentity.team;
+    return { targetId, team };
+  }
+
+  /**
+   * Ticket 07b: a check target must have an identity (a role + team). The
+   * host sits in `state.players` (alive) but never gets an identity at
+   * startGame, so checks on the host are meaningless — reject explicitly
+   * rather than returning a half-defined result. `WRONG_ROLE` is a soft
+   * semantic fit (the actor's role is fine, but the target isn't
+   * checkable); we keep the existing code to avoid widening the public
+   * EngineErrorCode surface.
+   */
+  private requireCheckedTarget(targetId: string): PlayerIdentity {
+    const identity = this.identities.get(targetId);
+    if (!identity) {
+      throw new EngineError(
+        EngineErrorCode.WRONG_ROLE,
+        `Target ${targetId} cannot be checked`,
+      );
+    }
+    return identity;
   }
 
   /**

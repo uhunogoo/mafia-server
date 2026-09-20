@@ -1561,4 +1561,373 @@ describe("mafia_room", () => {
     assert.strictEqual(setup.room.state.nominations.length, 2);
     assert.strictEqual(setup.room.state.phase, GamePhase.DAY_BALAGAN);
   });
+
+  // ─── Ticket 07b: private check delivery ─────────────────────────────
+
+  describe("private check delivery (ticket 07b)", () => {
+  /**
+   * Connect a fresh room with a host + 10 guests and pin the deterministic
+   * role layout used by other tests (guests[0]=DON, guests[1]=MAFIA,
+   * guests[2]=SHERIFF, guests[3]=DOCTOR, others=CIVILIAN). Returns the
+   * clients plus subscription helpers for the four private-message streams
+   * the ticket cares about.
+   */
+  async function setup10() {
+    const setup = await setupRoom(colyseus, 10);
+    // Default phase after setupRoom is NIGHT — checks are valid here.
+    return setup;
+  }
+
+  /** Subscribe every client to `type`, return per-client arrays. */
+  function captureMessages(
+    setup: Setup,
+    type: string,
+  ): {
+    host: unknown[];
+    guests: unknown[][];
+  } {
+    const host: unknown[] = [];
+    const guests: unknown[][] = setup.guests.map(() => []);
+    setup.host.onMessage(type, (p: unknown) => host.push(p));
+    for (let i = 0; i < setup.guests.length; i++) {
+      setup.guests[i].onMessage(type, (p: unknown) => guests[i].push(p));
+    }
+    return { host, guests };
+  }
+
+  it("Don's donCheck is delivered to the Don's session and the host (no other client)", async () => {
+    const setup = await setup10();
+    // guests[0] = DON, guests[2] = SHERIFF — the Don checks the Sheriff.
+    const don = setup.guests[0];
+    const target = setup.guests[2].sessionId;
+
+    const captured = captureMessages(setup, "donCheckResult");
+
+    don.send("donCheck", { targetId: target });
+    await setup.room.waitForNextPatch();
+    // Allow the private sends to flush.
+    await new Promise((r) => setTimeout(r, 50));
+
+    assert.strictEqual(
+      captured.guests[0].length,
+      1,
+      "Don receives exactly one donCheckResult",
+    );
+    assert.deepStrictEqual(captured.guests[0][0], {
+      targetId: target,
+      isSheriff: true,
+    });
+    // Per CONTEXT.md "Check delivery": the host observes the same data.
+    assert.strictEqual(captured.host.length, 1, "host receives a copy for moderation");
+    assert.deepStrictEqual(captured.host[0], {
+      targetId: target,
+      isSheriff: true,
+    });
+
+    // No other client (non-actor, non-host) received the result.
+    for (let i = 0; i < setup.guests.length; i++) {
+      if (i === 0) continue;
+      assert.strictEqual(
+        captured.guests[i].length,
+        0,
+        `guest ${i} must not receive the Don's check result`,
+      );
+    }
+  });
+
+  it("Don checking a non-Sheriff gets isSheriff: false, still private to Don + host", async () => {
+    const setup = await setup10();
+    const don = setup.guests[0];
+    const target = setup.guests[4].sessionId; // guests[4] = CIVILIAN
+
+    const captured = captureMessages(setup, "donCheckResult");
+
+    don.send("donCheck", { targetId: target });
+    await setup.room.waitForNextPatch();
+    await new Promise((r) => setTimeout(r, 50));
+
+    assert.strictEqual(captured.guests[0].length, 1);
+    assert.deepStrictEqual(captured.guests[0][0], {
+      targetId: target,
+      isSheriff: false,
+    });
+    assert.strictEqual(captured.host.length, 1);
+    assert.deepStrictEqual(captured.host[0], {
+      targetId: target,
+      isSheriff: false,
+    });
+
+    // The target (guests[4]) must not be told they were checked.
+    assert.strictEqual(captured.guests[4].length, 0, "target is not notified");
+  });
+
+  it("Sheriff's sheriffCheck is delivered to the Sheriff's session and the host (no other client)", async () => {
+    const setup = await setup10();
+    // guests[2] = SHERIFF, guests[4] = CIVILIAN — Sheriff checks a Civilian.
+    const sheriff = setup.guests[2];
+    const target = setup.guests[4].sessionId;
+
+    const captured = captureMessages(setup, "sheriffCheckResult");
+
+    sheriff.send("sheriffCheck", { targetId: target });
+    await setup.room.waitForNextPatch();
+    await new Promise((r) => setTimeout(r, 50));
+
+    assert.strictEqual(captured.guests[2].length, 1);
+    assert.deepStrictEqual(captured.guests[2][0], {
+      targetId: target,
+      team: "RED",
+    });
+    assert.strictEqual(captured.host.length, 1);
+    assert.deepStrictEqual(captured.host[0], {
+      targetId: target,
+      team: "RED",
+    });
+
+    for (let i = 0; i < setup.guests.length; i++) {
+      if (i === 2) continue;
+      assert.strictEqual(
+        captured.guests[i].length,
+        0,
+        `guest ${i} must not receive the Sheriff's check result`,
+      );
+    }
+  });
+
+  it("Sheriff checking the Don always receives team: BLACK (and host sees the same)", async () => {
+    const setup = await setup10();
+    // guests[2] = SHERIFF, guests[0] = DON — Sheriff checks the Don.
+    const sheriff = setup.guests[2];
+    const target = setup.guests[0].sessionId;
+
+    const captured = captureMessages(setup, "sheriffCheckResult");
+
+    sheriff.send("sheriffCheck", { targetId: target });
+    await setup.room.waitForNextPatch();
+    await new Promise((r) => setTimeout(r, 50));
+
+    assert.strictEqual(captured.guests[2].length, 1);
+    assert.deepStrictEqual(captured.guests[2][0], {
+      targetId: target,
+      team: "BLACK",
+    });
+    assert.strictEqual(captured.host.length, 1);
+    assert.deepStrictEqual(captured.host[0], {
+      targetId: target,
+      team: "BLACK",
+    });
+  });
+
+  it("Sheriff checking a Mafia member receives team: BLACK", async () => {
+    const setup = await setup10();
+    const sheriff = setup.guests[2];
+    const target = setup.guests[1].sessionId; // guests[1] = MAFIA
+
+    const captured = captureMessages(setup, "sheriffCheckResult");
+
+    sheriff.send("sheriffCheck", { targetId: target });
+    await setup.room.waitForNextPatch();
+    await new Promise((r) => setTimeout(r, 50));
+
+    assert.strictEqual(captured.guests[2].length, 1);
+    assert.deepStrictEqual(captured.guests[2][0], {
+      targetId: target,
+      team: "BLACK",
+    });
+    assert.strictEqual(captured.host.length, 1);
+    assert.deepStrictEqual(captured.host[0], {
+      targetId: target,
+      team: "BLACK",
+    });
+  });
+
+  it("the target player receives nothing about being checked", async () => {
+    const setup = await setup10();
+    // Don (guests[0]) checks guests[4]. guests[4] should get no message of
+    // any private type relating to the check.
+    const don = setup.guests[0];
+    const targetIdx = 4;
+    const target = setup.guests[targetIdx];
+
+    const donResult: unknown[] = [];
+    const targetResults: unknown[] = [];
+    const targetSheriffResult: unknown[] = [];
+    don.onMessage("donCheckResult", (p: unknown) => donResult.push(p));
+    target.onMessage("donCheckResult", (p: unknown) => targetResults.push(p));
+    target.onMessage("sheriffCheckResult", (p: unknown) => targetSheriffResult.push(p));
+
+    don.send("donCheck", { targetId: target.sessionId });
+    await setup.room.waitForNextPatch();
+    await new Promise((r) => setTimeout(r, 50));
+
+    assert.strictEqual(donResult.length, 1, "Don gets their result");
+    assert.strictEqual(
+      targetResults.length,
+      0,
+      "target must NOT receive donCheckResult on their own session",
+    );
+    assert.strictEqual(
+      targetSheriffResult.length,
+      0,
+      "target must NOT receive sheriffCheckResult on their own session",
+    );
+  });
+
+  it("the public Player schema has no lastCheckedId or check-history field after a check", async () => {
+    const setup = await setup10();
+    const don = setup.guests[0];
+    const targetIdx = 4;
+
+    don.send("donCheck", { targetId: setup.guests[targetIdx].sessionId });
+    await setup.room.waitForNextPatch();
+    await new Promise((r) => setTimeout(r, 50));
+
+    // Schema fields are exposed on the SDK state for each connected client.
+    for (const g of setup.guests) {
+      const p = g.state.players.get(setup.guests[targetIdx].sessionId);
+      assert.ok(p, "target player still present in the schema");
+      assert.strictEqual(
+        (p as unknown as Record<string, unknown>).lastCheckedId,
+        undefined,
+        "no lastCheckedId leaked into the schema",
+      );
+      assert.strictEqual(
+        (p as unknown as Record<string, unknown>).checkHistory,
+        undefined,
+        "no checkHistory leaked into the schema",
+      );
+      assert.strictEqual(
+        (p as unknown as Record<string, unknown>).isSheriff,
+        undefined,
+        "no isSheriff leaked into the schema",
+      );
+      assert.strictEqual(
+        (p as unknown as Record<string, unknown>).donChecked,
+        undefined,
+        "no donChecked leaked into the schema",
+      );
+      assert.strictEqual(
+        (p as unknown as Record<string, unknown>).sheriffChecked,
+        undefined,
+        "no sheriffChecked leaked into the schema",
+      );
+    }
+  });
+
+  it("a wrong-role donCheck is rejected with an error to the actor only", async () => {
+    const setup = await setup10();
+    // guests[1] = MAFIA — not the Don — tries to donCheck.
+    const errors: string[] = [];
+    const donResults: unknown[] = [];
+    setup.guests[1].onMessage("error", (msg: unknown) => {
+      errors.push(String((msg as { message?: string }).message ?? msg));
+    });
+    setup.guests[1].onMessage("donCheckResult", (p: unknown) => donResults.push(p));
+
+    const captured = captureMessages(setup, "donCheckResult");
+
+    setup.guests[1].send("donCheck", { targetId: setup.guests[4].sessionId });
+    await setup.room.waitForNextPatch();
+    await new Promise((r) => setTimeout(r, 50));
+
+    assert.ok(errors.length >= 1, "actor must receive an error");
+    assert.strictEqual(donResults.length, 0, "actor must NOT receive a result");
+    // No one else received a result either.
+    for (let i = 0; i < captured.guests.length; i++) {
+      assert.strictEqual(captured.guests[i].length, 0, `guest ${i} result`);
+    }
+    assert.strictEqual(captured.host.length, 0);
+  });
+
+  it("a wrong-role sheriffCheck is rejected with an error to the actor only", async () => {
+    const setup = await setup10();
+    // guests[1] = MAFIA — not the Sheriff — tries to sheriffCheck.
+    const errors: string[] = [];
+    setup.guests[1].onMessage("error", (msg: unknown) => {
+      errors.push(String((msg as { message?: string }).message ?? msg));
+    });
+    setup.guests[1].onMessage("sheriffCheckResult", (p: unknown) => {
+      errors.push("unexpected sheriffCheckResult");
+    });
+
+    const captured = captureMessages(setup, "sheriffCheckResult");
+
+    setup.guests[1].send("sheriffCheck", { targetId: setup.guests[4].sessionId });
+    await setup.room.waitForNextPatch();
+    await new Promise((r) => setTimeout(r, 50));
+
+    assert.ok(errors.length >= 1, "actor must receive an error");
+    for (let i = 0; i < captured.guests.length; i++) {
+      assert.strictEqual(captured.guests[i].length, 0, `guest ${i} result`);
+    }
+    assert.strictEqual(captured.host.length, 0);
+  });
+
+  it("two consecutive donChecks overwrite — only the most recent result is delivered to the Don", async () => {
+    const setup = await setup10();
+    const don = setup.guests[0];
+
+    const results: unknown[] = [];
+    don.onMessage("donCheckResult", (p: unknown) => results.push(p));
+    const captured = captureMessages(setup, "donCheckResult");
+
+    // First: Don checks the Sheriff (guests[2]).
+    don.send("donCheck", { targetId: setup.guests[2].sessionId });
+    await setup.room.waitForNextPatch();
+    // Second: Don checks a Civilian (guests[4]).
+    don.send("donCheck", { targetId: setup.guests[4].sessionId });
+    await setup.room.waitForNextPatch();
+    await new Promise((r) => setTimeout(r, 50));
+
+    assert.strictEqual(results.length, 2, "Don receives one result per check");
+    assert.deepStrictEqual(results[0], {
+      targetId: setup.guests[2].sessionId,
+      isSheriff: true,
+    });
+    assert.deepStrictEqual(results[1], {
+      targetId: setup.guests[4].sessionId,
+      isSheriff: false,
+    });
+    // Host also receives one per check (CONTEXT.md "Check delivery").
+    assert.strictEqual(captured.host.length, 2);
+  });
+
+  it("Don and Sheriff checks are fully independent — each actor only sees their own result", async () => {
+    const setup = await setup10();
+    const don = setup.guests[0];
+    const sheriff = setup.guests[2];
+
+    const donResults: unknown[] = [];
+    const sheriffResults: unknown[] = [];
+    don.onMessage("donCheckResult", (p: unknown) => donResults.push(p));
+    sheriff.onMessage("sheriffCheckResult", (p: unknown) => sheriffResults.push(p));
+
+    // Don checks guests[4] (CIVILIAN) → isSheriff: false.
+    don.send("donCheck", { targetId: setup.guests[4].sessionId });
+    await setup.room.waitForNextPatch();
+    // Sheriff checks guests[0] (the Don) → team: BLACK.
+    sheriff.send("sheriffCheck", { targetId: don.sessionId });
+    await setup.room.waitForNextPatch();
+    await new Promise((r) => setTimeout(r, 50));
+
+    assert.strictEqual(donResults.length, 1);
+    assert.deepStrictEqual(donResults[0], {
+      targetId: setup.guests[4].sessionId,
+      isSheriff: false,
+    });
+    assert.strictEqual(sheriffResults.length, 1);
+    assert.deepStrictEqual(sheriffResults[0], {
+      targetId: don.sessionId,
+      team: "BLACK",
+    });
+
+    // The Sheriff must not receive the Don's result, and vice versa.
+    const crossLeaks: string[] = [];
+    don.onMessage("sheriffCheckResult", () => crossLeaks.push("don got sheriff"));
+    sheriff.onMessage("donCheckResult", () => crossLeaks.push("sheriff got don"));
+    // Allow any cross-routed messages to flush.
+    await new Promise((r) => setTimeout(r, 50));
+    assert.strictEqual(crossLeaks.length, 0, "no cross-leak between check results");
+  });
+  });
 });

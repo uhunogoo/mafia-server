@@ -3,7 +3,13 @@ import { MafiaState } from "./schema/MafiaState.js";
 import { Auth } from "../config/auth.js";
 import { Engine } from "../game/Engine.js";
 import type { PhaseTimerEvent } from "../game/PhaseTimer.js";
-import { EngineError, EngineErrorCode, PingRecord } from "../game/types.js";
+import {
+  DonCheckResult,
+  EngineError,
+  EngineErrorCode,
+  PingRecord,
+  SheriffCheckResult,
+} from "../game/types.js";
 
 const INVITE_TTL_MS = 1000 * 60 * 60 * 6;
 const PHASE_TIMER_TICK_MS = 250;
@@ -94,7 +100,21 @@ export class MafiaRoom extends Room {
         this.fail(client, "targetId is required");
         return;
       }
-      this.runEngine(() => this.engine.donCheck(client.sessionId, payload.targetId), client);
+      // Capture the return value so the private result can be routed.
+      // Using a direct try/catch (like `ping`) instead of `runEngine` —
+      // runEngine swallows the return value.
+      let result: DonCheckResult;
+      try {
+        result = this.engine.donCheck(client.sessionId, payload.targetId);
+      } catch (e) {
+        this.fail(client, this.engineErrorMessage(e));
+        return;
+      }
+      // Per CONTEXT.md "Check delivery": the actor gets the result privately
+      // and the host observes the same data in real time for moderation.
+      // No other client receives the result.
+      client.send("donCheckResult", result);
+      this.sendCheckResultToHost("donCheckResult", result);
     },
     sheriffCheck: (client: Client, payload: { targetId: string }) => {
       if (!this.requireActiveSender(client)) return;
@@ -102,7 +122,16 @@ export class MafiaRoom extends Room {
         this.fail(client, "targetId is required");
         return;
       }
-      this.runEngine(() => this.engine.sheriffCheck(client.sessionId, payload.targetId), client);
+      let result: SheriffCheckResult;
+      try {
+        result = this.engine.sheriffCheck(client.sessionId, payload.targetId);
+      } catch (e) {
+        this.fail(client, this.engineErrorMessage(e));
+        return;
+      }
+      // Per CONTEXT.md "Check delivery": actor + host only.
+      client.send("sheriffCheckResult", result);
+      this.sendCheckResultToHost("sheriffCheckResult", result);
     },
     doctorHeal: (client: Client, payload: { targetId: string }) => {
       if (!this.requireActiveSender(client)) return;
@@ -361,6 +390,19 @@ export class MafiaRoom extends Room {
     if (!host) return;
     if (host.sessionId === fromId || host.sessionId === toId) return;
     host.send("ping", record);
+  }
+
+  /**
+   * Ticket 07b: per CONTEXT.md "Check delivery", the host observes the same
+   * check data in real time for moderation. The actor already received the
+   * payload directly from the message handler; we just forward a copy to
+   * the host's session if one is connected. The actor is never the host
+   * (the host has no role), so no skip-on-actor check is needed.
+   */
+  private sendCheckResultToHost(type: string, payload: unknown): void {
+    const host = this.findHostClient();
+    if (!host) return;
+    host.send(type, payload);
   }
 
   /**

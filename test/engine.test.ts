@@ -2385,3 +2385,360 @@ describe("Engine — Day 2+ BALAGAN + first-word rule (ticket 07)", () => {
     });
   });
 });
+
+// ─── Ticket 07b: Private check delivery ─────────────────────────────────
+
+describe("Engine — private check delivery (ticket 07b)", () => {
+  /**
+   * Fresh game in NIGHT with deterministic roles:
+   *   p0=DON, p1=MAFIA, p2=SHERIFF, p3=DOCTOR, p4..p9=CIVILIAN.
+   */
+  function setupGame(): { state: MafiaState; engine: Engine } {
+    const state = freshState(10);
+    const engine = new Engine(state);
+    engine.startGame();
+    engine._assignRoleForTest("p0", Role.DON);
+    engine._assignRoleForTest("p1", Role.MAFIA);
+    engine._assignRoleForTest("p2", Role.SHERIFF);
+    engine._assignRoleForTest("p3", Role.DOCTOR);
+    for (let i = 4; i < 10; i++) {
+      engine._assignRoleForTest(`p${i}`, Role.CIVILIAN);
+    }
+    return { state, engine };
+  }
+
+  describe("donCheck return value", () => {
+    it("returns isSheriff: true when the target is the Sheriff", () => {
+      const { engine } = setupGame();
+      const result = engine.donCheck("p0", "p2");
+      assert.deepStrictEqual(result, { targetId: "p2", isSheriff: true });
+    });
+
+    it("returns isSheriff: false when the target is a Civilian", () => {
+      const { engine } = setupGame();
+      const result = engine.donCheck("p0", "p4");
+      assert.deepStrictEqual(result, { targetId: "p4", isSheriff: false });
+    });
+
+    it("returns isSheriff: false when the target is the Doctor", () => {
+      const { engine } = setupGame();
+      const result = engine.donCheck("p0", "p3");
+      assert.deepStrictEqual(result, { targetId: "p3", isSheriff: false });
+    });
+
+    it("returns isSheriff: false when the target is a Mafia member", () => {
+      const { engine } = setupGame();
+      const result = engine.donCheck("p0", "p1");
+      assert.deepStrictEqual(result, { targetId: "p1", isSheriff: false });
+    });
+
+    it("records the action in the action log for downstream consumption", () => {
+      const { engine } = setupGame();
+      engine.donCheck("p0", "p2");
+      const lastLog = engine.getActionLog().at(-1)!;
+      assert.strictEqual(lastLog.type, "DON_CHECK");
+      assert.strictEqual(lastLog.actorSessionId, "p0");
+      assert.strictEqual((lastLog.payload as { targetId: string }).targetId, "p2");
+    });
+
+    it("writes a DON_CHECK log entry without leaking the result", () => {
+      const { engine } = setupGame();
+      engine.donCheck("p0", "p2");
+      const lastLog = engine.getActionLog().at(-1)!;
+      assert.strictEqual(lastLog.type, "DON_CHECK");
+      assert.strictEqual(lastLog.actorSessionId, "p0");
+      assert.strictEqual((lastLog.payload as { targetId: string }).targetId, "p2");
+      // The result is never written into the log payload.
+      assert.strictEqual(
+        (lastLog.payload as Record<string, unknown>).isSheriff,
+        undefined,
+        "isSheriff must not appear in the public action log",
+      );
+      assert.strictEqual(
+        (lastLog.payload as Record<string, unknown>).result,
+        undefined,
+      );
+    });
+
+    it("does not mutate the public Player schema (no lastCheckedId, no check history)", () => {
+      const { state, engine } = setupGame();
+      const playerBefore = JSON.parse(JSON.stringify(state.players.get("p2")));
+      engine.donCheck("p0", "p2");
+      const playerAfter = state.players.get("p2")!;
+      // The only fields on Player are: sessionId, name, seatIndex, isAlive,
+      // isHost, isMissing, votes. Nothing about checks.
+      const allowedKeys = new Set([
+        "sessionId",
+        "name",
+        "seatIndex",
+        "isAlive",
+        "isHost",
+        "isMissing",
+        "votes",
+      ]);
+      for (const key of Object.keys(playerAfter)) {
+        assert.ok(
+          allowedKeys.has(key),
+          `unexpected field on Player: ${key}`,
+        );
+      }
+      assert.strictEqual(
+        (playerAfter as unknown as Record<string, unknown>).lastCheckedId,
+        undefined,
+        "no lastCheckedId field",
+      );
+      assert.deepStrictEqual(
+        JSON.parse(JSON.stringify(playerAfter)),
+        playerBefore,
+        "player schema is byte-for-byte unchanged",
+      );
+    });
+
+    it("does not write the result into any state field", () => {
+      const { state, engine } = setupGame();
+      // Capture pre-call snapshot for comparison.
+      const before = JSON.parse(JSON.stringify(state));
+      engine.donCheck("p0", "p2");
+      // The mafiaTargetId / doctorTargetId / died / dayCount fields are the
+      // legitimate state fields; everything else must be byte-identical.
+      const after = JSON.parse(JSON.stringify(state));
+      const mutableKeys = new Set([
+        "mafiaTargetId",
+        "doctorTargetId",
+        "died",
+        "dayCount",
+        "phase",
+        "nightStep",
+      ]);
+      for (const k of Object.keys(after)) {
+        if (mutableKeys.has(k)) continue;
+        assert.deepStrictEqual(
+          after[k],
+          before[k],
+          `state.${k} should be unchanged after donCheck`,
+        );
+      }
+      // And the schema-level public state has nothing about checks either.
+      assert.ok(
+        !/donCheck|sheriffCheck|isSheriff|checkResult/i.test(
+          JSON.stringify(state),
+        ),
+        "no check-related keys leaked into the public state",
+      );
+    });
+  });
+
+  describe("sheriffCheck return value", () => {
+    it("returns team: RED when the target is a Civilian", () => {
+      const { engine } = setupGame();
+      const result = engine.sheriffCheck("p2", "p4");
+      assert.deepStrictEqual(result, { targetId: "p4", team: Team.RED });
+    });
+
+    it("returns team: RED when the target is the Doctor", () => {
+      const { engine } = setupGame();
+      const result = engine.sheriffCheck("p2", "p3");
+      assert.deepStrictEqual(result, { targetId: "p3", team: Team.RED });
+    });
+
+    it("returns team: BLACK when the target is a Mafia member", () => {
+      const { engine } = setupGame();
+      const result = engine.sheriffCheck("p2", "p1");
+      assert.deepStrictEqual(result, { targetId: "p1", team: Team.BLACK });
+    });
+
+    it("returns team: BLACK when the target is the Don (the override)", () => {
+      const { engine } = setupGame();
+      const result = engine.sheriffCheck("p2", "p0");
+      assert.deepStrictEqual(result, { targetId: "p0", team: Team.BLACK });
+    });
+
+    it("records the action in the action log for downstream consumption", () => {
+      const { engine } = setupGame();
+      engine.sheriffCheck("p2", "p0");
+      const lastLog = engine.getActionLog().at(-1)!;
+      assert.strictEqual(lastLog.type, "SHERIFF_CHECK");
+      assert.strictEqual(lastLog.actorSessionId, "p2");
+      assert.strictEqual((lastLog.payload as { targetId: string }).targetId, "p0");
+    });
+
+    it("writes a SHERIFF_CHECK log entry without leaking the result", () => {
+      const { engine } = setupGame();
+      engine.sheriffCheck("p2", "p0");
+      const lastLog = engine.getActionLog().at(-1)!;
+      assert.strictEqual(lastLog.type, "SHERIFF_CHECK");
+      assert.strictEqual(lastLog.actorSessionId, "p2");
+      assert.strictEqual((lastLog.payload as { targetId: string }).targetId, "p0");
+      // The result is never written into the log payload.
+      assert.strictEqual(
+        (lastLog.payload as Record<string, unknown>).team,
+        undefined,
+        "team must not appear in the public action log",
+      );
+      assert.strictEqual(
+        (lastLog.payload as Record<string, unknown>).result,
+        undefined,
+      );
+    });
+  });
+
+  describe("donCheck / sheriffCheck error paths still hold", () => {
+    it("donCheck rejects a non-Don actor", () => {
+      const { engine } = setupGame();
+      assert.throws(() => engine.donCheck("p1", "p2"), (err: unknown) => {
+        return (err as { code: string }).code === EngineErrorCode.WRONG_ROLE;
+      });
+    });
+
+    it("sheriffCheck rejects a non-Sheriff actor", () => {
+      const { engine } = setupGame();
+      assert.throws(() => engine.sheriffCheck("p1", "p2"), (err: unknown) => {
+        return (err as { code: string }).code === EngineErrorCode.WRONG_ROLE;
+      });
+    });
+
+    it("donCheck rejects the Don checking themselves", () => {
+      const { engine } = setupGame();
+      assert.throws(() => engine.donCheck("p0", "p0"), (err: unknown) => {
+        return (err as { code: string }).code === EngineErrorCode.WRONG_ROLE;
+      });
+    });
+
+    it("sheriffCheck rejects the Sheriff checking themselves", () => {
+      const { engine } = setupGame();
+      assert.throws(() => engine.sheriffCheck("p2", "p2"), (err: unknown) => {
+        return (err as { code: string }).code === EngineErrorCode.WRONG_ROLE;
+      });
+    });
+
+    it("donCheck rejects a target not at the table", () => {
+      const { engine } = setupGame();
+      assert.throws(() => engine.donCheck("p0", "ghost"), (err: unknown) => {
+        return (err as { code: string }).code === EngineErrorCode.PLAYER_MISSING;
+      });
+    });
+
+    it("sheriffCheck rejects a target not at the table", () => {
+      const { engine } = setupGame();
+      assert.throws(() => engine.sheriffCheck("p2", "ghost"), (err: unknown) => {
+        return (err as { code: string }).code === EngineErrorCode.PLAYER_MISSING;
+      });
+    });
+
+    it("donCheck rejects a dead target", () => {
+      const { state, engine } = setupGame();
+      state.players.get("p2")!.isAlive = false;
+      assert.throws(() => engine.donCheck("p0", "p2"), (err: unknown) => {
+        return (err as { code: string }).code === EngineErrorCode.PLAYER_DEAD;
+      });
+    });
+
+    it("sheriffCheck rejects a dead target", () => {
+      const { state, engine } = setupGame();
+      state.players.get("p2")!.isAlive = false;
+      assert.throws(() => engine.sheriffCheck("p2", "p0"), (err: unknown) => {
+        return (err as { code: string }).code === EngineErrorCode.PLAYER_DEAD;
+      });
+    });
+
+    it("donCheck rejects a dead actor", () => {
+      const { state, engine } = setupGame();
+      state.players.get("p0")!.isAlive = false;
+      assert.throws(() => engine.donCheck("p0", "p2"), (err: unknown) => {
+        return (err as { code: string }).code === EngineErrorCode.PLAYER_DEAD;
+      });
+    });
+
+    it("donCheck rejects checking the host (no identity)", () => {
+      // The host is in state.players (isAlive=true) but has no role, so the
+      // engine must refuse — a "half-defined" identity lookup would leak
+      // weird states into the result.
+      const { engine } = setupGame();
+      assert.throws(() => engine.donCheck("p0", "host"), (err: unknown) => {
+        return (err as { code: string }).code === EngineErrorCode.WRONG_ROLE;
+      });
+    });
+
+    it("sheriffCheck rejects checking the host (no identity)", () => {
+      const { engine } = setupGame();
+      assert.throws(() => engine.sheriffCheck("p2", "host"), (err: unknown) => {
+        return (err as { code: string }).code === EngineErrorCode.WRONG_ROLE;
+      });
+    });
+
+    it("donCheck rejects a check outside the NIGHT phase", () => {
+      const state = freshState(10);
+      const engine = new Engine(state);
+      // Don't startGame: phase is LOBBY.
+      engine._assignRoleForTest("p0", Role.DON);
+      engine._assignRoleForTest("p2", Role.SHERIFF);
+      assert.throws(() => engine.donCheck("p0", "p2"), (err: unknown) => {
+        return (err as { code: string }).code === EngineErrorCode.WRONG_PHASE;
+      });
+    });
+
+    it("sheriffCheck rejects a check outside the NIGHT phase", () => {
+      const state = freshState(10);
+      const engine = new Engine(state);
+      engine._assignRoleForTest("p0", Role.DON);
+      engine._assignRoleForTest("p2", Role.SHERIFF);
+      assert.throws(() => engine.sheriffCheck("p2", "p0"), (err: unknown) => {
+        return (err as { code: string }).code === EngineErrorCode.WRONG_PHASE;
+      });
+    });
+
+    it("donCheck on the previous target still throws — the old stub never returned, but it never leaked either", () => {
+      // A second check on the same night must overwrite (not append) per the
+      // existing engine semantics, and the most recent result is what the
+      // caller sees. The previous result is not retained anywhere.
+      const { engine } = setupGame();
+      const r1 = engine.donCheck("p0", "p4");
+      const r2 = engine.donCheck("p0", "p2");
+      assert.deepStrictEqual(r1, { targetId: "p4", isSheriff: false });
+      assert.deepStrictEqual(r2, { targetId: "p2", isSheriff: true });
+      // Only the most recent action is recorded (last entry is the second check).
+      const lastLog = engine.getActionLog().at(-1)!;
+      assert.strictEqual(lastLog.type, "DON_CHECK");
+      assert.strictEqual(lastLog.actorSessionId, "p0");
+      assert.strictEqual((lastLog.payload as { targetId: string }).targetId, "p2");
+    });
+
+    it("a failed donCheck throws and does not record the action", () => {
+      const { engine } = setupGame();
+      const logLenBefore = engine.getActionLog().length;
+      // Wrong actor (Sheriff trying to donCheck).
+      assert.throws(() => engine.donCheck("p2", "p4"));
+      // No new log entry should have been written.
+      assert.strictEqual(engine.getActionLog().length, logLenBefore);
+    });
+
+    it("a failed sheriffCheck throws and does not record the action", () => {
+      const { engine } = setupGame();
+      const logLenBefore = engine.getActionLog().length;
+      assert.throws(() => engine.sheriffCheck("p0", "p4"));
+      assert.strictEqual(engine.getActionLog().length, logLenBefore);
+    });
+  });
+
+  describe("isolation between actors and targets", () => {
+    it("Don's check result is independent of any prior Sheriff check on the same target", () => {
+      const { engine } = setupGame();
+      // Sheriff checks the Sheriff role holder first — gets RED.
+      const r1 = engine.sheriffCheck("p2", "p3"); // p3 = Doctor = RED
+      // Then the Don checks the same target — gets isSheriff: false (Doctor is not Sheriff).
+      const r2 = engine.donCheck("p0", "p3");
+      assert.deepStrictEqual(r1, { targetId: "p3", team: Team.RED });
+      assert.deepStrictEqual(r2, { targetId: "p3", isSheriff: false });
+    });
+
+    it("the Don-override for the Sheriff is independent of the Don's own check", () => {
+      const { engine } = setupGame();
+      // Sheriff checks the Don — should report BLACK (the override).
+      const r1 = engine.sheriffCheck("p2", "p0");
+      // The Don's own check on someone else is unaffected.
+      const r2 = engine.donCheck("p0", "p4");
+      assert.deepStrictEqual(r1, { targetId: "p0", team: Team.BLACK });
+      assert.deepStrictEqual(r2, { targetId: "p4", isSheriff: false });
+    });
+  });
+});

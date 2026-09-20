@@ -93,6 +93,27 @@ export interface PlayerIdentity {
 }
 
 /**
+ * Result of the Don's check action (ticket 07b). Returned by `engine.donCheck`
+ * and routed privately to the Don's client — never to the target, other
+ * players, or the public schema.
+ */
+export interface DonCheckResult {
+  targetId: string;
+  isSheriff: boolean;
+}
+
+/**
+ * Result of the Sheriff's check action (ticket 07b). Returned by
+ * `engine.sheriffCheck` and routed privately to the Sheriff's client. The Don
+ * always reports as BLACK to the Sheriff (per spec); for every other role the
+ * reported team is the target's canonical team.
+ */
+export interface SheriffCheckResult {
+  targetId: string;
+  team: Team;
+}
+
+/**
  * Result of resolving a single night. The engine applies this to the public
  * `state.died` field; tests assert on it.
  */
