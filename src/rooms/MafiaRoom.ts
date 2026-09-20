@@ -89,6 +89,7 @@ export class MafiaRoom extends Room {
       this.runEngine(() => this.engine.mafiaKill(client.sessionId, payload.targetId), client);
     },
     donCheck: (client: Client, payload: { targetId: string }) => {
+      if (!this.requireActiveSender(client)) return;
       if (typeof payload?.targetId !== "string") {
         this.fail(client, "targetId is required");
         return;
@@ -96,6 +97,7 @@ export class MafiaRoom extends Room {
       this.runEngine(() => this.engine.donCheck(client.sessionId, payload.targetId), client);
     },
     sheriffCheck: (client: Client, payload: { targetId: string }) => {
+      if (!this.requireActiveSender(client)) return;
       if (typeof payload?.targetId !== "string") {
         this.fail(client, "targetId is required");
         return;
@@ -103,6 +105,7 @@ export class MafiaRoom extends Room {
       this.runEngine(() => this.engine.sheriffCheck(client.sessionId, payload.targetId), client);
     },
     doctorHeal: (client: Client, payload: { targetId: string }) => {
+      if (!this.requireActiveSender(client)) return;
       if (typeof payload?.targetId !== "string") {
         this.fail(client, "targetId is required");
         return;
@@ -126,6 +129,7 @@ export class MafiaRoom extends Room {
       this.runEngine(() => this.engine.nextDefense(), client);
     },
     nominate: (client: Client, payload: { targetId: string }) => {
+      if (!this.requireActiveSender(client)) return;
       if (typeof payload?.targetId !== "string") {
         this.fail(client, "targetId is required");
         return;
@@ -133,6 +137,7 @@ export class MafiaRoom extends Room {
       this.runEngine(() => this.engine.nominate(client.sessionId, payload.targetId), client);
     },
     vote: (client: Client, payload: { targetId: string }) => {
+      if (!this.requireActiveSender(client)) return;
       if (typeof payload?.targetId !== "string") {
         this.fail(client, "targetId is required");
         return;
@@ -178,7 +183,26 @@ export class MafiaRoom extends Room {
         this.notifyHostOfDeclaredDead(targetId);
       }, client);
     },
+    kick: (client: Client, payload: { sessionId: string; reason?: string }) => {
+      if (!this.requireHost(client)) return;
+      if (typeof payload?.sessionId !== "string") {
+        this.fail(client, "sessionId is required");
+        return;
+      }
+      const reason = typeof payload?.reason === "string" ? payload.reason : "";
+      this.runEngine(() => this.engine.kick(client.sessionId, payload.sessionId, reason), client);
+    },
+    foul: (client: Client, payload: { sessionId: string; reason?: string }) => {
+      if (!this.requireHost(client)) return;
+      if (typeof payload?.sessionId !== "string") {
+        this.fail(client, "sessionId is required");
+        return;
+      }
+      const reason = typeof payload?.reason === "string" ? payload.reason : "";
+      this.runEngine(() => this.engine.foul(client.sessionId, payload.sessionId, reason), client);
+    },
     ping: (client: Client, payload: { toId: string }) => {
+      if (!this.requireActiveSender(client)) return;
       if (typeof payload?.toId !== "string") {
         this.fail(client, "toId is required");
         return;
@@ -292,6 +316,23 @@ export class MafiaRoom extends Room {
     const ok = this.state.players.get(client.sessionId)?.isHost === true;
     if (!ok) this.fail(client, "Тільки хост може це робити");
     return ok;
+  }
+
+  /**
+   * Ticket 06: dead and kicked players are read-only spectators — they stay
+   * connected and observe the public state, but cannot send anything. Every
+   * player-action handler routes through this gate before touching the
+   * engine; host-only handlers skip it (requireHost already guards them and
+   * the host is never a game participant).
+   *
+   * Returns `true` when the sender may act; `false` after sending the
+   * player-visible rejection (same wording as the engine's PLAYER_DEAD).
+   */
+  private requireActiveSender(client: Client): boolean {
+    const player = this.state.players.get(client.sessionId);
+    if (!player || player.isHost || player.isAlive) return true;
+    this.fail(client, "Мертвий гравець не може діяти");
+    return false;
   }
 
   /**

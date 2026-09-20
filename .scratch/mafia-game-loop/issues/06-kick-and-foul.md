@@ -4,11 +4,11 @@
 
 **Blocked by:** 03.
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] Host can issue `kick{sessionId, reason}` to mark a player dead and reduce them to a read-only spectator.
-- [ ] Kicked players stay connected and observe public day-phase state but cannot send anything.
-- [ ] Host can issue `foul{sessionId, reason}` to log a foul without affecting the player's game state.
-- [ ] Both actions are logged in the host action log.
-- [ ] The engine's `onPlayerDied` seam is called for kicks (so victory check fires).
-- [ ] Test: kick → player `isAlive = false`, can read state, cannot send actions; foul → log entry only, player state unchanged.
+- [x] Host can issue `kick{sessionId, reason}` to mark a player dead and reduce them to a read-only spectator.
+- [x] Kicked players stay connected and observe public day-phase state but cannot send anything.
+- [x] Host can issue `foul{sessionId, reason}` to log a foul without affecting the player's game state.
+- [x] Both actions are logged in the host action log.
+- [x] The engine's `onPlayerDied` seam is called for kicks (so victory check fires).
+- [x] Test: kick → player `isAlive = false`, can read state, cannot send actions; foul → log entry only, player state unchanged.

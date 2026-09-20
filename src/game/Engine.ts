@@ -84,6 +84,17 @@ function shuffle<T>(items: readonly T[]): T[] {
  *    mafia kills observes the declaration so future victory-check work
  *    (ticket 09) plugs in transparently
  *
+ * Slice-6 (ticket 06) adds host moderation (kept separate from phase flow):
+ *  - kick marks a player dead and reduces them to a read-only spectator —
+ *    the seat is held and the role stays sealed, but every player action is
+ *    rejected; the onPlayerDied seam fires with KICKED so the victory check
+ *    treats an ejection like any other death
+ *  - foul records a warning in the host action log without touching the
+ *    player's game state
+ *  - donCheck / sheriffCheck / doctorHeal now also require the actor to be
+ *    alive, so a dead or kicked role-holder cannot act (the room gates
+ *    non-host messages from dead players as the first line of defense)
+ *
  * The engine never touches the network; the room translates `EngineError`
  * into player-visible messages and `client.send` for private role reveals.
  */
@@ -384,6 +395,7 @@ export class Engine {
   donCheck(actorSessionId: string, targetId: string): void {
     this.requirePhase(GamePhase.NIGHT);
     this.requireRole(actorSessionId, Role.DON);
+    this.requireAlivePlayer(actorSessionId);
     this.requireAlivePlayer(targetId);
     if (actorSessionId === targetId) {
       throw new EngineError(
@@ -406,6 +418,7 @@ export class Engine {
   sheriffCheck(actorSessionId: string, targetId: string): void {
     this.requirePhase(GamePhase.NIGHT);
     this.requireRole(actorSessionId, Role.SHERIFF);
+    this.requireAlivePlayer(actorSessionId);
     this.requireAlivePlayer(targetId);
     if (actorSessionId === targetId) {
       throw new EngineError(
@@ -430,6 +443,7 @@ export class Engine {
   doctorHeal(actorSessionId: string, targetId: string): void {
     this.requirePhase(GamePhase.NIGHT);
     this.requireRole(actorSessionId, Role.DOCTOR);
+    this.requireAlivePlayer(actorSessionId);
     this.requireAlivePlayer(targetId);
 
     const previous = this.lastHealed.get(actorSessionId) ?? "";
@@ -1353,6 +1367,97 @@ export class Engine {
     } else {
       this.phaseTimer.resume(this.now());
     }
+  }
+
+  // ─── Host moderation: kick + foul (ticket 06) ────────────────────────────
+
+  /**
+   * Host-only: eject a player from the game (e.g. for showing a role card).
+   * The player is marked dead and reduced to a read-only spectator: they
+   * stay connected and observe the public state, but every player action is
+   * rejected (the room gates non-host messages from dead players; the
+   * role-action guards added in this ticket are defense in depth). The seat
+   * is held — the player stays in `state.players` with their seatIndex, and
+   * their role identity stays sealed in the engine (never revealed).
+   *
+   * Moderation, not phase-flow (kept separate from the phase timers): kick
+   * does not advance, pause, or resume anything. If the kicked player was
+   * mid-turn the host moves the round along manually (skipPhase).
+   *
+   * The `onPlayerDied` seam fires with cause `KICKED` so the victory check
+   * (ticket 09) sees an ejection exactly like any other death.
+   *
+   * Guards: requires host, requires an active game (LOBBY has no game to be
+   * ejected from and GAME_OVER state is frozen for the reveal), requires the
+   * target to be at the table, alive, and not the host.
+   */
+  kick(hostSessionId: string, targetId: string, reason: string): void {
+    this.requireHost(hostSessionId);
+    if (
+      this.state.phase === GamePhase.LOBBY ||
+      this.state.phase === GamePhase.GAME_OVER
+    ) {
+      throw new EngineError(
+        EngineErrorCode.WRONG_PHASE,
+        `kick requires an active game, currently ${this.state.phase}`,
+      );
+    }
+    const player = this.state.players.get(targetId);
+    if (!player) {
+      throw new EngineError(
+        EngineErrorCode.PLAYER_MISSING,
+        `Player ${targetId} is not at the table`,
+      );
+    }
+    if (player.isHost) {
+      throw new EngineError(
+        EngineErrorCode.WRONG_ROLE,
+        "The host cannot be kicked",
+      );
+    }
+    if (!player.isAlive) {
+      throw new EngineError(
+        EngineErrorCode.PLAYER_DEAD,
+        `Player ${targetId} is already dead`,
+      );
+    }
+
+    player.isAlive = false;
+
+    this.logEntry({
+      actorSessionId: hostSessionId,
+      type: ActionType.KICK,
+      payload: { sessionId: targetId, reason },
+    });
+
+    // Same seam as mafia kills / vote eliminations / declared-dead: one
+    // observation point for every way a player leaves the living.
+    this.onPlayerDied?.(targetId, "KICKED");
+  }
+
+  /**
+   * Host-only: record a foul (a formal warning) against a player without
+   * touching their game state — the player stays alive and fully active.
+   * A pure log entry: the host UI reads FOUL entries out of the action log.
+   *
+   * Works in any phase, including LOBBY and GAME_OVER (a warning before the
+   * game or after a death is still a warning); the only requirements are
+   * host authority and the target being at the table.
+   */
+  foul(hostSessionId: string, targetId: string, reason: string): void {
+    this.requireHost(hostSessionId);
+    if (!this.state.players.has(targetId)) {
+      throw new EngineError(
+        EngineErrorCode.PLAYER_MISSING,
+        `Player ${targetId} is not at the table`,
+      );
+    }
+
+    this.logEntry({
+      actorSessionId: hostSessionId,
+      type: ActionType.FOUL,
+      payload: { sessionId: targetId, reason },
+    });
   }
 
   /**

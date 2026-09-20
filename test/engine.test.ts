@@ -1756,10 +1756,11 @@ describe("Engine — disconnect pause + declareDead (ticket 05)", () => {
 
     // Drive into DAY_VOTING where `vote` is the natural action — it already
     // calls `requireAlivePlayer(actorSessionId)`, which is the same dead-guard
-    // any post-declareDead action will trip.
-    engine._assignRoleForTest("p3", Role.DOCTOR);
+    // any post-declareDead action will trip. The Doctor must be someone other
+    // than p3: a dead role-holder can no longer heal (ticket 06 actor guard).
+    engine._assignRoleForTest("p8", Role.DOCTOR);
     engine.mafiaKill("host", "p4");
-    engine.doctorHeal("p3", "p4");
+    engine.doctorHeal("p8", "p4");
     engine.resolveNight();
     engine.startSpeeches();
     engine.nominate("p0", "p6");
@@ -1821,5 +1822,208 @@ describe("Engine — disconnect pause + declareDead (ticket 05)", () => {
     assert.strictEqual(state.players.get("p3")!.isAlive, false);
     assert.strictEqual(fired, true);
     assert.strictEqual(engine.getPhaseTimer(), null, "no timer was armed");
+  });
+});
+
+// ─── Ticket 06: Kick + foul ─────────────────────────────────────────────
+
+describe("Engine — kick + foul (ticket 06)", () => {
+  /** Fresh game in NIGHT with deterministic roles: p0=DON, p1=MAFIA,
+   *  p2=SHERIFF, p3=DOCTOR, p4..p9=CIVILIAN. */
+  function setupGame(): { state: MafiaState; engine: Engine } {
+    const state = freshState(10);
+    const engine = new Engine(state);
+    engine.startGame();
+    engine._assignRoleForTest("p0", Role.DON);
+    engine._assignRoleForTest("p1", Role.MAFIA);
+    engine._assignRoleForTest("p2", Role.SHERIFF);
+    engine._assignRoleForTest("p3", Role.DOCTOR);
+    for (let i = 4; i < 10; i++) {
+      engine._assignRoleForTest(`p${i}`, Role.CIVILIAN);
+    }
+    return { state, engine };
+  }
+
+  describe("kick", () => {
+    it("marks the player dead and holds their seat in state.players", () => {
+      const { state, engine } = setupGame();
+      const seatBefore = state.players.get("p4")!.seatIndex;
+
+      engine.kick("host", "p4", "showing a role card");
+
+      assert.strictEqual(state.players.get("p4")!.isAlive, false);
+      assert.ok(state.players.has("p4"), "kicked player stays in state.players");
+      assert.strictEqual(state.players.get("p4")!.seatIndex, seatBefore, "seat is held");
+      assert.strictEqual(engine.getRole("p4"), Role.CIVILIAN, "role identity preserved (still sealed)");
+    });
+
+    it("fires onPlayerDied with the KICKED cause", () => {
+      const { engine } = setupGame();
+
+      let deadId = "";
+      let cause: string = "";
+      engine.setOnPlayerDied((id, c) => {
+        deadId = id;
+        cause = c;
+      });
+
+      engine.kick("host", "p4", "showing a role card");
+
+      assert.strictEqual(deadId, "p4");
+      assert.strictEqual(cause, "KICKED");
+    });
+
+    it("logs a KICK entry with actor, target and reason", () => {
+      const { engine } = setupGame();
+      engine.kick("host", "p4", "showing a role card");
+
+      const lastLog = engine.getActionLog().at(-1)!;
+      assert.strictEqual(lastLog.type, "KICK");
+      assert.strictEqual(lastLog.actorSessionId, "host");
+      assert.strictEqual((lastLog.payload as { sessionId: string }).sessionId, "p4");
+      assert.strictEqual((lastLog.payload as { reason: string }).reason, "showing a role card");
+    });
+
+    it("kicked player cannot act: donCheck, doctorHeal and ping all rejected with PLAYER_DEAD", () => {
+      const { engine } = setupGame();
+      engine.kick("host", "p0", "leaving");
+      engine.kick("host", "p3", "leaving");
+
+      assert.throws(() => engine.donCheck("p0", "p4"), (err: unknown) => {
+        return (err as { code: string }).code === EngineErrorCode.PLAYER_DEAD;
+      });
+      assert.throws(() => engine.doctorHeal("p3", "p5"), (err: unknown) => {
+        return (err as { code: string }).code === EngineErrorCode.PLAYER_DEAD;
+      });
+      assert.throws(() => engine.ping("p0", "p1"), (err: unknown) => {
+        return (err as { code: string }).code === EngineErrorCode.PLAYER_DEAD;
+      });
+    });
+
+    it("rejects a non-host caller and leaves the target alive", () => {
+      const { state, engine } = setupGame();
+      assert.throws(() => engine.kick("p0", "p4", "mutiny"), (err: unknown) => {
+        return (err as { code: string }).code === EngineErrorCode.NOT_HOST;
+      });
+      assert.strictEqual(state.players.get("p4")!.isAlive, true);
+    });
+
+    it("rejects a target that is not at the table", () => {
+      const { engine } = setupGame();
+      assert.throws(() => engine.kick("host", "ghost", "boo"), (err: unknown) => {
+        return (err as { code: string }).code === EngineErrorCode.PLAYER_MISSING;
+      });
+    });
+
+    it("rejects kicking the host", () => {
+      const { state, engine } = setupGame();
+      assert.throws(() => engine.kick("host", "host", "self-moderation"), (err: unknown) => {
+        return (err as { code: string }).code === EngineErrorCode.WRONG_ROLE;
+      });
+      assert.strictEqual(state.players.get("host")!.isAlive, true);
+    });
+
+    it("rejects an already-dead target", () => {
+      const { engine } = setupGame();
+      engine.kick("host", "p4", "first offence");
+      assert.throws(() => engine.kick("host", "p4", "second offence"), (err: unknown) => {
+        return (err as { code: string }).code === EngineErrorCode.PLAYER_DEAD;
+      });
+    });
+
+    it("is rejected in LOBBY (no game to be ejected from)", () => {
+      const state = freshState(10);
+      const engine = new Engine(state);
+      assert.throws(() => engine.kick("host", "p0", "too early"), (err: unknown) => {
+        return (err as { code: string }).code === EngineErrorCode.WRONG_PHASE;
+      });
+      assert.strictEqual(state.players.get("p0")!.isAlive, true);
+    });
+
+    it("is rejected in GAME_OVER", () => {
+      const { state, engine } = setupGame();
+      state.phase = GamePhase.GAME_OVER;
+      assert.throws(() => engine.kick("host", "p4", "too late"), (err: unknown) => {
+        return (err as { code: string }).code === EngineErrorCode.WRONG_PHASE;
+      });
+      assert.strictEqual(state.players.get("p4")!.isAlive, true);
+    });
+
+    it("is moderation, not phase-flow: phase, nightStep and timer are untouched", () => {
+      const now = { value: 0 };
+      const state = freshState(10);
+      const engine = new Engine(state, () => now.value);
+      engine.startGame();
+
+      engine.kick("host", "p4", "showing a role card");
+
+      assert.strictEqual(state.phase, GamePhase.NIGHT);
+      assert.strictEqual(state.nightStep, NightStep.MAFIA);
+      const snap = engine.getPhaseTimer();
+      assert.ok(snap, "mafia window still armed");
+      assert.strictEqual(snap!.mode, "MAFIA_WINDOW");
+      assert.strictEqual(snap!.paused, false, "timer was not paused by the kick");
+    });
+  });
+
+  describe("foul", () => {
+    it("logs a FOUL entry and leaves the player's game state untouched", () => {
+      const { state, engine } = setupGame();
+
+      let seamFired = false;
+      engine.setOnPlayerDied(() => {
+        seamFired = true;
+      });
+
+      const before = state.players.get("p4")!;
+      engine.foul("host", "p4", "flood-pinging");
+
+      assert.strictEqual(before.isAlive, true, "foul does not kill");
+      assert.strictEqual(before.votes, 0, "no state change");
+      assert.strictEqual(seamFired, false, "no death seam for a foul");
+
+      const lastLog = engine.getActionLog().at(-1)!;
+      assert.strictEqual(lastLog.type, "FOUL");
+      assert.strictEqual(lastLog.actorSessionId, "host");
+      assert.strictEqual((lastLog.payload as { sessionId: string }).sessionId, "p4");
+      assert.strictEqual((lastLog.payload as { reason: string }).reason, "flood-pinging");
+    });
+
+    it("can be issued against a dead player (a warning is informational)", () => {
+      const { state, engine } = setupGame();
+      state.players.get("p4")!.isAlive = false;
+
+      engine.foul("host", "p4", "bad manners after death");
+
+      const lastLog = engine.getActionLog().at(-1)!;
+      assert.strictEqual(lastLog.type, "FOUL");
+      assert.strictEqual((lastLog.payload as { sessionId: string }).sessionId, "p4");
+    });
+
+    it("works in any phase, including LOBBY", () => {
+      const state = freshState(10);
+      const engine = new Engine(state);
+      assert.strictEqual(state.phase, GamePhase.LOBBY);
+
+      engine.foul("host", "p0", "spam before the game");
+
+      const lastLog = engine.getActionLog().at(-1)!;
+      assert.strictEqual(lastLog.type, "FOUL");
+      assert.strictEqual(lastLog.phase, GamePhase.LOBBY);
+    });
+
+    it("rejects a non-host caller", () => {
+      const { engine } = setupGame();
+      assert.throws(() => engine.foul("p0", "p4", "mutiny"), (err: unknown) => {
+        return (err as { code: string }).code === EngineErrorCode.NOT_HOST;
+      });
+    });
+
+    it("rejects a target that is not at the table", () => {
+      const { engine } = setupGame();
+      assert.throws(() => engine.foul("host", "ghost", "boo"), (err: unknown) => {
+        return (err as { code: string }).code === EngineErrorCode.PLAYER_MISSING;
+      });
+    });
   });
 });

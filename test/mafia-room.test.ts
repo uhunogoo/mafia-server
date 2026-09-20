@@ -1012,4 +1012,144 @@ describe("mafia_room", () => {
     const types2 = logEntries[0].entries.map((e) => e.type);
     assert.ok(types2.includes("DEAD_DECLARED"), `log includes DEAD_DECLARED, got ${types2.join(", ")}`);
   });
+
+  // ─── Ticket 06: kick + foul ───────────────────────────────────────────
+
+  it("host can kick a player: marked dead server-side, still connected and reading public state", async () => {
+    const { room, host, guests } = await setupRoom(colyseus, 10);
+    const kickedId = guests[5].sessionId;
+
+    host.send("kick", { sessionId: kickedId, reason: "showing a role card" });
+    await room.waitForNextPatch();
+    await new Promise((r) => setTimeout(r, 50));
+
+    // Server-side: dead, but the seat is held.
+    assert.strictEqual(room.state.players.get(kickedId)!.isAlive, false);
+    assert.ok(room.state.players.has(kickedId), "kicked player stays in state.players");
+
+    // The kicked client is still connected and its SDK state view keeps
+    // syncing the public schema (read-only spectator).
+    const clientView = guests[5].state.players.get(kickedId)!;
+    assert.strictEqual(clientView.isAlive, false, "kicked client still receives public state");
+  });
+
+  it("kicked player cannot send anything: doctorHeal and ping rejected by the room gate", async () => {
+    const { room, host, guests } = await setupRoom(colyseus, 10);
+
+    // Kick the doctor — doctorHeal had no actor-alive guard before ticket 06,
+    // so this proves the room-level gate (not just per-action engine checks).
+    const kickedId = guests[3].sessionId;
+    host.send("kick", { sessionId: kickedId, reason: "leaving" });
+    await room.waitForNextPatch();
+
+    const errors: string[] = [];
+    guests[3].onMessage("error", (msg: unknown) => {
+      errors.push(String((msg as { message?: string }).message ?? msg));
+    });
+
+    guests[3].send("doctorHeal", { targetId: guests[4].sessionId });
+    await room.waitForNextPatch();
+    assert.ok(errors.length > 0, "kicked doctor must receive an error");
+    assert.strictEqual(room.state.doctorTargetId, "", "rejected heal must not write state");
+
+    // And in a day phase, a kicked player cannot ping either.
+    room.state.phase = GamePhase.DAY_SPEECHES;
+    await room.waitForNextPatch();
+    guests[3].send("ping", { toId: guests[4].sessionId });
+    await room.waitForNextPatch();
+    assert.ok(errors.length >= 2, "kicked player's ping must also be rejected");
+    assert.strictEqual(room.engine.getAllPings().length, 0, "no ping accepted from a kicked player");
+  });
+
+  it("kick routes through onPlayerDied with the KICKED cause", async () => {
+    const { room, host, guests } = await setupRoom(colyseus, 10);
+
+    let deadId = "";
+    let deadCause = "";
+    room.engine.setOnPlayerDied((id, cause) => {
+      deadId = id;
+      deadCause = cause;
+    });
+
+    const kickedId = guests[5].sessionId;
+    host.send("kick", { sessionId: kickedId, reason: "role card" });
+    await room.waitForNextPatch();
+
+    assert.strictEqual(deadId, kickedId);
+    assert.strictEqual(deadCause, "KICKED");
+  });
+
+  it("foul records a warning and leaves the player fully active", async () => {
+    const { room, host, guests } = await setupRoom(colyseus, 10);
+    const fouledId = guests[5].sessionId;
+
+    let seamFired = false;
+    room.engine.setOnPlayerDied(() => {
+      seamFired = true;
+    });
+
+    host.send("foul", { sessionId: fouledId, reason: "flood-pinging" });
+    await room.waitForNextPatch();
+
+    assert.strictEqual(room.state.players.get(fouledId)!.isAlive, true, "foul does not kill");
+    assert.strictEqual(seamFired, false, "no death seam for a foul");
+
+    // The fouled player is still a fully active participant.
+    room.state.phase = GamePhase.DAY_SPEECHES;
+    await room.waitForNextPatch();
+    const fouledErrors: string[] = [];
+    guests[5].onMessage("error", (msg: unknown) => {
+      fouledErrors.push(String(msg));
+    });
+    guests[5].send("ping", { toId: guests[6].sessionId });
+    await room.waitForNextPatch();
+    assert.strictEqual(fouledErrors.length, 0, "fouled player can still act");
+    assert.strictEqual(room.engine.getAllPings().length, 1);
+  });
+
+  it("KICK and FOUL entries appear in the host action log with actor, target and reason", async () => {
+    const { room, host, guests } = await setupRoom(colyseus, 10);
+
+    host.send("foul", { sessionId: guests[5].sessionId, reason: "flood-pinging" });
+    await room.waitForNextPatch();
+    host.send("kick", { sessionId: guests[6].sessionId, reason: "showing a role card" });
+    await room.waitForNextPatch();
+
+    const received: unknown[] = [];
+    host.onMessage("log", (payload: unknown) => received.push(payload));
+    host.send("getLog", { since: "" });
+    await room.waitForNextPatch();
+
+    const entries = (received[0] as { entries: Array<{ type: string; actorSessionId: string; payload: Record<string, unknown> }> }).entries;
+    const foul = entries.find((e) => e.type === "FOUL");
+    const kick = entries.find((e) => e.type === "KICK");
+    assert.ok(foul, "log includes FOUL");
+    assert.strictEqual(foul!.actorSessionId, host.sessionId);
+    assert.strictEqual(foul!.payload.sessionId, guests[5].sessionId);
+    assert.strictEqual(foul!.payload.reason, "flood-pinging");
+    assert.ok(kick, "log includes KICK");
+    assert.strictEqual(kick!.actorSessionId, host.sessionId);
+    assert.strictEqual(kick!.payload.sessionId, guests[6].sessionId);
+    assert.strictEqual(kick!.payload.reason, "showing a role card");
+  });
+
+  it("non-host cannot kick or foul", async () => {
+    const { room, guests } = await setupRoom(colyseus, 10);
+
+    const errors: string[] = [];
+    guests[0].onMessage("error", (msg: unknown) => {
+      errors.push(String((msg as { message?: string }).message ?? msg));
+    });
+
+    guests[0].send("kick", { sessionId: guests[5].sessionId, reason: "mutiny" });
+    await room.waitForNextPatch();
+    guests[0].send("foul", { sessionId: guests[5].sessionId, reason: "mutiny" });
+    await room.waitForNextPatch();
+
+    assert.ok(errors.length >= 2, "non-host should be rejected for both actions");
+    assert.strictEqual(room.state.players.get(guests[5].sessionId)!.isAlive, true, "no kick happened");
+    const logTypes = room.engine.getActionLog().map((e) => e.type);
+    assert.ok(!logTypes.includes("KICK"), "no KICK entry");
+    assert.ok(!logTypes.includes("FOUL"), "no FOUL entry");
+  });
 });

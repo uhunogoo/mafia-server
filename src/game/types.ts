@@ -107,12 +107,14 @@ export interface NightResolution {
  * a single subscription; the room uses it to react to elimination (currently
  * logging and victory checks — those are follow-up tickets). Day-cycle
  * elimination fires `VOTE_ELIMINATION`; night deaths use `MAFIA_KILL`;
- * disconnect declarations use `DECLARED_DEAD`.
+ * disconnect declarations use `DECLARED_DEAD`; host moderation (ticket 06)
+ * uses `KICKED`.
  */
 export type DeathCause =
   | "MAFIA_KILL"
   | "VOTE_ELIMINATION"
-  | "DECLARED_DEAD";
+  | "DECLARED_DEAD"
+  | "KICKED";
 
 /**
  * Result of resolving a day cycle's voting round. The engine applies this
