@@ -868,44 +868,13 @@ export class Engine {
   }
 
   /**
-   * Transition DAY_ANNOUNCEMENT → DAY_SPEECHES. Computes the speaking order
-   * (alive non-host players in seat order), points at the first speaker, and
-   * writes `state.currentSpeakerId` so clients can render the speaker badge.
-   *
-   * On Day 2+ (`dayCount >= 2`) the speaking order is rotated so the first
-   * speaker is the seat immediately clockwise from the previous day's first
-   * speaker — the "first-word right shifts clockwise" rule (ticket 07). The
-   * first speaker of the new day is recorded for tomorrow's rotation.
-   *
-   * Resets `firstSpeakerNominated` so the new day's first speaker must
-   * nominate afresh (or not at all, on Day 1).
+   * Open the day's speech round. The single public entry into DAY_SPEECHES:
+   * validates that the day is in DAY_ANNOUNCEMENT, then delegates the work to
+   * `enterDaySpeeches` on every day.
    */
   startSpeeches(): void {
     this.requirePhase(GamePhase.DAY_ANNOUNCEMENT);
-
-    this.speakingOrder = this.computeSpeakingOrder();
-    // Remember the new first speaker so tomorrow's rotation can start from
-    // the seat after them.
-    this.firstSpeakerId = this.speakingOrder[0] ?? "";
-    this.firstSpeakerNominated = false;
-    this.currentSpeakerIndex = this.speakingOrder.length === 0 ? -1 : 0;
-    this.state.phase = GamePhase.DAY_SPEECHES;
-    this.state.currentSpeakerId = this.getCurrentSpeaker();
-    this.state.currentDefenseId = "";
-
-    // Arm the per-turn speech timer for the first speaker (or skip when no
-    // speakers remain — same as nextSpeaker's auto-transition path).
-    if (this.speakingOrder.length > 0) {
-      this.startTimer("SPEECH_TURN");
-    } else {
-      this.clearTimer();
-    }
-
-    this.logEntry({
-      actorSessionId: "",
-      type: ActionType.PHASE_ADVANCE,
-      payload: { event: "speeches_started", speakerCount: this.speakingOrder.length },
-    });
+    this.enterDaySpeeches();
   }
 
   /**
@@ -1542,6 +1511,49 @@ export class Engine {
       actorSessionId: "",
       type: ActionType.PHASE_ADVANCE,
       payload: { event: "defense_started", defenseCount: this.defenseOrder.length },
+    });
+  }
+
+  /**
+   * Enter DAY_SPEECHES. This is the day's roster freeze point: the speaking
+   * order is computed here (alive non-host players in seat order), the first
+   * speaker is pointed at, and `state.currentSpeakerId` is written so clients
+   * can render the speaker badge.
+   *
+   * On Day 2+ (`dayCount >= 2`) the speaking order is rotated so the first
+   * speaker is the seat immediately clockwise from the previous day's first
+   * speaker — the "first-word right shifts clockwise" rule (ticket 07). The
+   * first speaker of the new day is recorded for tomorrow's rotation.
+   *
+   * Resets `firstSpeakerNominated` so the new day's first speaker must
+   * nominate afresh (or not at all, on Day 1).
+   *
+   * Private and unguarded, like the other phase-entry methods; its only
+   * caller is `startSpeeches`, which owns the DAY_ANNOUNCEMENT guard.
+   */
+  private enterDaySpeeches(): void {
+    this.speakingOrder = this.computeSpeakingOrder();
+    // Remember the new first speaker so tomorrow's rotation can start from
+    // the seat after them.
+    this.firstSpeakerId = this.speakingOrder[0] ?? "";
+    this.firstSpeakerNominated = false;
+    this.currentSpeakerIndex = this.speakingOrder.length === 0 ? -1 : 0;
+    this.state.phase = GamePhase.DAY_SPEECHES;
+    this.state.currentSpeakerId = this.getCurrentSpeaker();
+    this.state.currentDefenseId = "";
+
+    // Arm the per-turn speech timer for the first speaker (or skip when no
+    // speakers remain — same as nextSpeaker's auto-transition path).
+    if (this.speakingOrder.length > 0) {
+      this.startTimer("SPEECH_TURN");
+    } else {
+      this.clearTimer();
+    }
+
+    this.logEntry({
+      actorSessionId: "",
+      type: ActionType.PHASE_ADVANCE,
+      payload: { event: "speeches_started", speakerCount: this.speakingOrder.length },
     });
   }
 
