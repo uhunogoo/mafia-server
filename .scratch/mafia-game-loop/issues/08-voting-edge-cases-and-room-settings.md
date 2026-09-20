@@ -6,6 +6,9 @@
 
 **Status:** ready-for-agent
 
+- [ ] **Remove the temporary tie-break from ticket 03** (deterministic "first in nomination order"). It was a placeholder; replace with the ADR 0003 behavior below. Update the ticket-03 tests that encoded the placeholder.
+- [ ] **Votes are immutable once cast.** A second `vote(actor, target)` from the same actor is rejected (rules.md: simultaneous voting). Re-vote support is explicitly out of scope. Add a test: duplicate vote submission is rejected.
+
 - [ ] Room-creation accepts `revoteCap: number` (default 3) and `revoteBehavior: "host-arbitrates" | "auto-pardon"` (default "host-arbitrates").
 - [ ] 2-way tie at any revote → auto-pardon, day ends, night falls.
 - [ ] 3+ way tie → revote among all tied leaders.

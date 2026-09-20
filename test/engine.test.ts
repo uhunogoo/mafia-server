@@ -2027,3 +2027,361 @@ describe("Engine — kick + foul (ticket 06)", () => {
     });
   });
 });
+
+describe("Engine — Day 2+ BALAGAN + first-word rule (ticket 07)", () => {
+  /**
+   * Drive the engine from LOBBY through a complete Day 1 cycle (mafia kill
+   * with save, speeches, defense, voting, resolveVoting) ending in NIGHT
+   * with dayCount still 1. Helper for tests that want a fresh Day 2 morning.
+   */
+  function driveDay1(): Engine {
+    const state = freshState(10);
+    const engine = new Engine(state);
+    engine.startGame();
+    engine._assignRoleForTest("p3", Role.DOCTOR);
+    // Mafia kills p4; Doctor saves p4 so all 10 players remain alive for the
+    // speaking-order / first-word rotation tests.
+    engine.mafiaKill("host", "p4");
+    engine.doctorHeal("p3", "p4");
+    engine.resolveNight();
+    // Day 1 cycle: nominate p6 so defense has one candidate, drive through
+    // every speaker, every defender, then resolve voting.
+    engine.startSpeeches();
+    engine.nominate("p0", "p6");
+    const order = engine.getSpeakingOrder();
+    for (let i = 0; i < order.length; i++) {
+      engine.nextSpeaker();
+    }
+    const dOrder = engine.getDefenseOrder();
+    for (let i = 0; i < dOrder.length; i++) {
+      engine.nextDefense();
+    }
+    engine.resolveVoting();
+    // After resolveVoting: phase = NIGHT, dayCount = 1 (unchanged until the
+    // next resolveNight).
+    return engine;
+  }
+
+  /**
+   * From a NIGHT (post-vote) engine, drive Night 2 with a save so all 10
+   * players remain alive. Leaves the engine in DAY_ANNOUNCEMENT with
+   * `dayCount = 2` — ready for `startSpeeches()` on Day 2.
+   */
+  function driveNight2(engine: Engine): void {
+    engine.mafiaKill("host", "p5");
+    engine.doctorHeal("p3", "p5");
+    engine.resolveNight();
+  }
+
+  /**
+   * Drive the engine all the way through Day 2 (speeches, BALAGAN, defense,
+   * voting) so the next `startSpeeches` lands on Day 3. The first-word rule
+   * is satisfied (first speaker nominates), and BALAGAN is skipped with
+   * `skipPhase` to avoid driving the clock.
+   */
+  function driveDay2(engine: Engine): void {
+    engine.startSpeeches();
+    engine.nominate("p1", "p6");
+    const order = engine.getSpeakingOrder();
+    for (let i = 0; i < order.length; i++) {
+      engine.nextSpeaker();
+    }
+    // Day 2 ends the last speech in DAY_BALAGAN — skip past it for the test.
+    engine.skipPhase("host");
+    const dOrder = engine.getDefenseOrder();
+    for (let i = 0; i < dOrder.length; i++) {
+      engine.nextDefense();
+    }
+    engine.resolveVoting();
+  }
+
+  describe("Day 2+ speaking-order rotation", () => {
+    it("Day 1 first speaker is the lowest seatIndex alive non-host", () => {
+      const state = freshState(10);
+      const engine = new Engine(state);
+      engine.startGame();
+      engine._assignRoleForTest("p3", Role.DOCTOR);
+      engine.mafiaKill("host", "p4");
+      engine.doctorHeal("p3", "p4");
+      engine.resolveNight();
+      // Now: DAY_ANNOUNCEMENT, dayCount = 1.
+      engine.startSpeeches();
+      assert.strictEqual(engine.getCurrentSpeaker(), "p0");
+      assert.deepStrictEqual(engine.getSpeakingOrder()[0], "p0");
+    });
+
+    it("Day 2 first speaker is the seat immediately clockwise from Day 1's first speaker", () => {
+      const engine = driveDay1();
+      driveNight2(engine);
+      engine.startSpeeches();
+      assert.strictEqual(engine.getCurrentSpeaker(), "p1");
+      assert.deepStrictEqual(engine.getSpeakingOrder()[0], "p1");
+    });
+
+    it("Day 3 first speaker is the seat immediately clockwise from Day 2's first speaker", () => {
+      const engine = driveDay1();
+      driveNight2(engine);
+      driveDay2(engine);
+      // After Day 2 voting, we're in NIGHT with dayCount = 2. Drive Night 3.
+      engine.mafiaKill("host", "p6");
+      engine.doctorHeal("p3", "p6");
+      engine.resolveNight();
+      // Now: DAY_ANNOUNCEMENT, dayCount = 3.
+      engine.startSpeeches();
+      assert.strictEqual(engine.getCurrentSpeaker(), "p2");
+      assert.deepStrictEqual(engine.getSpeakingOrder()[0], "p2");
+    });
+
+    it("rotation wraps when the previous first speaker was at the highest seat", () => {
+      // Drive to DAY_ANNOUNCEMENT for Day 3 (dayCount = 3) with all 10
+      // players alive and `firstSpeakerId` seeded to p9 (the highest seat).
+      // Calling `startSpeeches` should wrap to the lowest seat — p0.
+      const state = freshState(10);
+      const engine = new Engine(state);
+      engine.startGame();
+      engine._assignRoleForTest("p3", Role.DOCTOR);
+
+      // Manually advance the day counter to 3 (simulating three resolved
+      // nights) and pin `firstSpeakerId` to p9. We bypass resolveNight for
+      // brevity — the rotation only depends on `state.dayCount` and
+      // `firstSpeakerId`, not on the in-between night flow. The phase must
+      // also be DAY_ANNOUNCEMENT because startSpeeches guards on it.
+      state.dayCount = 3;
+      state.phase = GamePhase.DAY_ANNOUNCEMENT;
+      engine._setFirstSpeakerIdForTest("p9");
+
+      engine.startSpeeches();
+      // Day 4's first speaker must wrap from p9 (seat 9, the highest) to
+      // the lowest seat alive — p0.
+      assert.strictEqual(engine.getCurrentSpeaker(), "p0");
+      assert.deepStrictEqual(engine.getSpeakingOrder()[0], "p0");
+    });
+  });
+
+  describe("first-word rule (Day 2+ first speaker must nominate)", () => {
+    it("Day 1 first speaker may end their speech without nominating", () => {
+      const state = freshState(10);
+      const engine = new Engine(state);
+      engine.startGame();
+      engine._assignRoleForTest("p3", Role.DOCTOR);
+      engine.mafiaKill("host", "p4");
+      engine.doctorHeal("p3", "p4");
+      engine.resolveNight();
+      engine.startSpeeches();
+      // No nomination. nextSpeaker should succeed on Day 1.
+      engine.nextSpeaker();
+      // Engine should now be on the second speaker (p1).
+      assert.strictEqual(engine.state.phase, GamePhase.DAY_SPEECHES);
+      assert.strictEqual(engine.getCurrentSpeaker(), "p1");
+    });
+
+    it("Day 2 first speaker ending their speech without a nomination is rejected", () => {
+      const engine = driveDay1();
+      driveNight2(engine);
+      engine.startSpeeches();
+      // First speaker is p1; they have not nominated. nextSpeaker rejects.
+      assert.strictEqual(engine.getCurrentSpeaker(), "p1");
+      assert.throws(
+        () => engine.nextSpeaker(),
+        (err: unknown) => (err as { code: string }).code === EngineErrorCode.WRONG_PHASE,
+      );
+      // State is unchanged — phase is still DAY_SPEECHES, still p1.
+      assert.strictEqual(engine.state.phase, GamePhase.DAY_SPEECHES);
+      assert.strictEqual(engine.getCurrentSpeaker(), "p1");
+    });
+
+    it("Day 2 first speaker nominating themselves satisfies the first-word rule", () => {
+      const engine = driveDay1();
+      driveNight2(engine);
+      engine.startSpeeches();
+      engine.nominate("p1", "p1"); // self-nomination is allowed
+      // nextSpeaker should now succeed.
+      engine.nextSpeaker();
+      assert.strictEqual(engine.state.phase, GamePhase.DAY_SPEECHES);
+      assert.strictEqual(engine.getCurrentSpeaker(), "p2");
+    });
+
+    it("Day 2 first speaker nominating another player satisfies the first-word rule", () => {
+      const engine = driveDay1();
+      driveNight2(engine);
+      engine.startSpeeches();
+      engine.nominate("p1", "p6");
+      engine.nextSpeaker();
+      assert.strictEqual(engine.state.phase, GamePhase.DAY_SPEECHES);
+      assert.strictEqual(engine.getCurrentSpeaker(), "p2");
+    });
+
+    it("the first-word flag is reset at the start of each new day", () => {
+      const engine = driveDay1();
+      driveNight2(engine);
+      driveDay2(engine);
+      // Drive Night 3 (no deaths).
+      engine.mafiaKill("host", "p7");
+      engine.doctorHeal("p3", "p7");
+      engine.resolveNight();
+      // Day 3 starts. firstSpeakerId was p1; rotation puts p2 first.
+      engine.startSpeeches();
+      assert.strictEqual(engine.getCurrentSpeaker(), "p2");
+      // p2 has not nominated yet. Without a nomination, nextSpeaker must
+      // reject — confirms the flag was reset (not carried over from Day 2
+      // where p1 nominated).
+      assert.throws(
+        () => engine.nextSpeaker(),
+        (err: unknown) => (err as { code: string }).code === EngineErrorCode.WRONG_PHASE,
+      );
+    });
+
+    it("the first-word rule only fires for the first speaker, not for subsequent speakers", () => {
+      const engine = driveDay1();
+      driveNight2(engine);
+      engine.startSpeeches();
+      engine.nominate("p1", "p6");
+      engine.nextSpeaker();
+      // p2 (second speaker) has not nominated. nextSpeaker should still
+      // succeed — the rule applies only to the first speaker.
+      assert.strictEqual(engine.getCurrentSpeaker(), "p2");
+      engine.nextSpeaker();
+      assert.strictEqual(engine.getCurrentSpeaker(), "p3");
+    });
+
+    it("the first-word rule is not triggered by nominations from non-first-speaker players", () => {
+      const engine = driveDay1();
+      driveNight2(engine);
+      engine.startSpeeches();
+      // p2 (NOT the first speaker) nominates first.
+      engine.nominate("p2", "p7");
+      // The first speaker (p1) still has not nominated, so nextSpeaker must
+      // reject.
+      assert.throws(
+        () => engine.nextSpeaker(),
+        (err: unknown) => (err as { code: string }).code === EngineErrorCode.WRONG_PHASE,
+      );
+    });
+  });
+
+  describe("Day 2+ phase sequence (BALAGAN between speeches and defense)", () => {
+    it("Day 2 final nextSpeaker auto-transitions to DAY_BALAGAN (not DAY_DEFENSE)", () => {
+      const engine = driveDay1();
+      driveNight2(engine);
+      engine.startSpeeches();
+      engine.nominate("p1", "p6");
+      const order = engine.getSpeakingOrder();
+      for (let i = 0; i < order.length; i++) {
+        engine.nextSpeaker();
+      }
+      // After the last speech on Day 2+, we should land in DAY_BALAGAN.
+      assert.strictEqual(engine.state.phase, GamePhase.DAY_BALAGAN);
+      // And a 90s BALAGAN timer should be armed.
+      const snap = engine.getPhaseTimer();
+      assert.ok(snap, "BALAGAN timer should be armed");
+      assert.strictEqual(snap!.mode, "BALAGAN");
+      assert.strictEqual(snap!.durationMs, 90_000);
+    });
+
+    it("BALAGAN timer expiry auto-transitions to DAY_DEFENSE", () => {
+      const engine = driveDay1();
+      driveNight2(engine);
+      // Inject fake clock BEFORE startSpeeches so the BALAGAN timer is
+      // armed at our controlled time, not at wall-clock now.
+      const now = { value: 0 };
+      engine._setClockForTest(() => now.value);
+      engine.startSpeeches();
+      engine.nominate("p1", "p6");
+      const order = engine.getSpeakingOrder();
+      for (let i = 0; i < order.length; i++) {
+        engine.nextSpeaker();
+      }
+      assert.strictEqual(engine.state.phase, GamePhase.DAY_BALAGAN);
+
+      // Jump to t=91s — past the 90s BALAGAN window.
+      now.value = 91_000;
+      const events = engine.tickPhaseTimer();
+      // Should have produced an EXPIRED event for BALAGAN.
+      assert.ok(
+        events.some((e) => e.type === "EXPIRED" && e.mode === "BALAGAN"),
+        "EXPIRED BALAGAN event should fire",
+      );
+      // Engine should have auto-transitioned to DAY_DEFENSE.
+      assert.strictEqual(engine.state.phase, GamePhase.DAY_DEFENSE);
+    });
+
+    it("host skipPhase during BALAGAN advances to DAY_DEFENSE", () => {
+      const engine = driveDay1();
+      driveNight2(engine);
+      engine.startSpeeches();
+      engine.nominate("p1", "p6");
+      const order = engine.getSpeakingOrder();
+      for (let i = 0; i < order.length; i++) {
+        engine.nextSpeaker();
+      }
+      assert.strictEqual(engine.state.phase, GamePhase.DAY_BALAGAN);
+
+      engine.skipPhase("host");
+      assert.strictEqual(engine.state.phase, GamePhase.DAY_DEFENSE);
+      // A DEFENSE_TURN timer should now be armed.
+      const snap = engine.getPhaseTimer();
+      assert.ok(snap);
+      assert.strictEqual(snap!.mode, "DEFENSE_TURN");
+    });
+
+    it("Day 1 still skips BALAGAN: final nextSpeaker auto-transitions directly to DAY_DEFENSE", () => {
+      // Sanity check that Day 1's behavior is unchanged. Use the
+      // `driveNightThenDay` shape (Night 1 → DAY_ANNOUNCEMENT) so we
+      // can immediately call startSpeeches on Day 1.
+      const state = freshState(10);
+      const engine = new Engine(state);
+      engine.startGame();
+      engine._assignRoleForTest("p3", Role.DOCTOR);
+      engine.mafiaKill("host", "p4");
+      engine.doctorHeal("p3", "p4");
+      engine.resolveNight();
+      engine.startSpeeches();
+      engine.nominate("p0", "p6");
+      const order = engine.getSpeakingOrder();
+      for (let i = 0; i < order.length; i++) {
+        engine.nextSpeaker();
+      }
+      // Day 1: directly into DAY_DEFENSE, no BALAGAN.
+      assert.strictEqual(engine.state.phase, GamePhase.DAY_DEFENSE);
+    });
+
+    it("nominate is still allowed during DAY_BALAGAN (existing phase guard)", () => {
+      const engine = driveDay1();
+      driveNight2(engine);
+      engine.startSpeeches();
+      engine.nominate("p1", "p6");
+      const order = engine.getSpeakingOrder();
+      for (let i = 0; i < order.length; i++) {
+        engine.nextSpeaker();
+      }
+      assert.strictEqual(engine.state.phase, GamePhase.DAY_BALAGAN);
+      // Any alive player can still add nominations during BALAGAN.
+      engine.nominate("p3", "p8");
+      assert.deepStrictEqual([...engine.state.nominations], ["p6", "p8"]);
+    });
+
+    it("a full Day 2 cycle ends in NIGHT (BALAGAN → DEFENSE → VOTING → NIGHT)", () => {
+      const engine = driveDay1();
+      driveNight2(engine);
+      engine.startSpeeches();
+      engine.nominate("p1", "p6");
+      const order = engine.getSpeakingOrder();
+      for (let i = 0; i < order.length; i++) {
+        engine.nextSpeaker();
+      }
+      // Day 2: should be in BALAGAN.
+      assert.strictEqual(engine.state.phase, GamePhase.DAY_BALAGAN);
+      // Skip BALAGAN manually so the test doesn't have to advance the clock.
+      engine.skipPhase("host");
+      assert.strictEqual(engine.state.phase, GamePhase.DAY_DEFENSE);
+      const dOrder = engine.getDefenseOrder();
+      for (let i = 0; i < dOrder.length; i++) {
+        engine.nextDefense();
+      }
+      assert.strictEqual(engine.state.phase, GamePhase.DAY_VOTING);
+      engine.resolveVoting();
+      assert.strictEqual(engine.state.phase, GamePhase.NIGHT);
+      assert.strictEqual(engine.state.dayCount, 2);
+    });
+  });
+});

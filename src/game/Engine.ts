@@ -95,6 +95,16 @@ function shuffle<T>(items: readonly T[]): T[] {
  *    alive, so a dead or kicked role-holder cannot act (the room gates
  *    non-host messages from dead players as the first line of defense)
  *
+ * Slice-7 (ticket 07) adds Day 2+ BALAGAN + first-word rule:
+ *  - on Day 2+ (`dayCount >= 2`), the day sequence inserts `DAY_BALAGAN`
+ *    between speeches and defense; Day 1 still skips BALAGAN per ADR 0005
+ *  - on Day 2+, the first speaker must nominate an elimination candidate
+ *    during their speech; `nextSpeaker` rejects the call when they haven't
+ *  - the first-word right shifts clockwise each day — the first speaker of
+ *    Day N+1 is the seat immediately after Day N's first speaker; this is
+ *    driven by tracking the previous day's first speaker sessionId and
+ *    rotating the speaking order to start from the next clockwise seat
+ *
  * The engine never touches the network; the room translates `EngineError`
  * into player-visible messages and `client.send` for private role reveals.
  */
@@ -170,6 +180,22 @@ export class Engine {
    * after `resolveVoting`.
    */
   private votes = new Map<string, string>();
+
+  /**
+   * SessionId of the previous day's first speaker. Used to rotate the Day 2+
+   * speaking order so the first-word right shifts clockwise each day. Empty
+   * string before the first day; updated by `startSpeeches` after computing
+   * the new speaking order (ticket 07).
+   */
+  private firstSpeakerId = "";
+
+  /**
+   * Has the current day's first speaker nominated an elimination candidate?
+   * Reset by `startSpeeches`; set when the first speaker calls `nominate`.
+   * On Day 2+ the engine rejects `nextSpeaker` when this is still false at
+   * the end of the first speaker's speech (ticket 07 — first-word rule).
+   */
+  private firstSpeakerNominated = false;
 
   /**
    * Optional seam fired whenever a player dies. Day-cycle elimination calls it
@@ -575,6 +601,14 @@ export class Engine {
     const target = this.state.players.get(targetId)!;
     target.isNominated = true;
 
+    // First-word rule (Day 2+): record that the current day's first speaker
+    // has nominated. The rule only requires the first speaker to nominate at
+    // least one candidate during their speech — subsequent nominations from
+    // any other player do not affect this flag.
+    if (actorSessionId === this.firstSpeakerId) {
+      this.firstSpeakerNominated = true;
+    }
+
     this.logEntry({
       actorSessionId,
       type: ActionType.NOMINATE,
@@ -586,11 +620,23 @@ export class Engine {
    * Transition DAY_ANNOUNCEMENT → DAY_SPEECHES. Computes the speaking order
    * (alive non-host players in seat order), points at the first speaker, and
    * writes `state.currentSpeakerId` so clients can render the speaker badge.
+   *
+   * On Day 2+ (`dayCount >= 2`) the speaking order is rotated so the first
+   * speaker is the seat immediately clockwise from the previous day's first
+   * speaker — the "first-word right shifts clockwise" rule (ticket 07). The
+   * first speaker of the new day is recorded for tomorrow's rotation.
+   *
+   * Resets `firstSpeakerNominated` so the new day's first speaker must
+   * nominate afresh (or not at all, on Day 1).
    */
   startSpeeches(): void {
     this.requirePhase(GamePhase.DAY_ANNOUNCEMENT);
 
     this.speakingOrder = this.computeSpeakingOrder();
+    // Remember the new first speaker so tomorrow's rotation can start from
+    // the seat after them.
+    this.firstSpeakerId = this.speakingOrder[0] ?? "";
+    this.firstSpeakerNominated = false;
     this.currentSpeakerIndex = this.speakingOrder.length === 0 ? -1 : 0;
     this.state.phase = GamePhase.DAY_SPEECHES;
     this.state.currentSpeakerId = this.getCurrentSpeaker();
@@ -613,17 +659,43 @@ export class Engine {
 
   /**
    * Advance to the next speaker in the clockwise order. When all speakers are
-   * done, auto-transition to DAY_DEFENSE (skipping DAY_BALAGAN on Day 1 per
-   * ADR 0005 — Day 2+ ticket 07 will revisit the BALAGAN insertion).
+   * done, auto-transition to DAY_BALAGAN (Day 2+) or DAY_DEFENSE (Day 1).
+   *
+   * Day 2+ inserts BALAGAN between speeches and defense per ADR 0005 / ticket
+   * 07. Day 1 (the first day) still skips BALAGAN.
+   *
+   * First-word rule (Day 2+): the first speaker must nominate an elimination
+   * candidate during their speech. When `nextSpeaker` is called to end that
+   * speech and they haven't nominated, the call is rejected with WRONG_PHASE
+   * — the day cannot advance to BALAGAN until the first speaker fulfils the
+   * nomination requirement. Day 1 has no such requirement.
    */
   nextSpeaker(): void {
     this.requirePhase(GamePhase.DAY_SPEECHES);
 
+    // First-word rule check — gate the advance when the current speaker is
+    // the first speaker of Day 2+ and they haven't nominated anyone yet.
+    if (
+      this.state.dayCount >= 2 &&
+      this.currentSpeakerIndex === 0 &&
+      !this.firstSpeakerNominated
+    ) {
+      throw new EngineError(
+        EngineErrorCode.WRONG_PHASE,
+        "First speaker on Day 2+ must nominate an elimination candidate during their speech",
+      );
+    }
+
     this.currentSpeakerIndex += 1;
     if (this.currentSpeakerIndex >= this.speakingOrder.length) {
-      // Defense begins with its own timer; enterDayDefense() arms it.
+      // All speeches done. Day 2+ inserts BALAGAN before defense; Day 1
+      // skips straight to defense per ADR 0005.
       this.clearTimer();
-      this.enterDayDefense();
+      if (this.state.dayCount >= 2) {
+        this.enterDayBalagan();
+      } else {
+        this.enterDayDefense();
+      }
       return;
     }
     this.state.currentSpeakerId = this.getCurrentSpeaker();
@@ -930,11 +1002,39 @@ export class Engine {
    * (clockwise). The host never speaks. Dead players are skipped — a player
    * who dies during the night is removed from the speech roster before
    * DAY_SPEECHES starts.
+   *
+   * On Day 2+ (`dayCount >= 2`) the order is rotated so the first speaker is
+   * the seat immediately clockwise from the previous day's first speaker
+   * (ticket 07 — first-word right shifts clockwise each day). If the previous
+   * first speaker is no longer at the table, we still have their seatIndex
+   * (the seat is held for the lifetime of the game, even after death or
+   * kick) — so the rotation uses the seatIndex as the anchor. If no alive
+   * player has a strictly greater seatIndex, we wrap to the lowest seat.
    */
   private computeSpeakingOrder(): string[] {
     const players = [...this.state.players.values()]
       .filter((p) => !p.isHost && p.isAlive)
       .sort((a, b) => a.seatIndex - b.seatIndex);
+    if (players.length === 0) return [];
+
+    // Day 2+ rotation: anchor on the previous day's first speaker seatIndex.
+    if (this.state.dayCount >= 2 && this.firstSpeakerId !== "") {
+      const prev = this.state.players.get(this.firstSpeakerId);
+      if (prev) {
+        const prevSeat = prev.seatIndex;
+        const startIdx = players.findIndex((p) => p.seatIndex > prevSeat);
+        if (startIdx !== -1) {
+          return [
+            ...players.slice(startIdx),
+            ...players.slice(0, startIdx),
+          ].map((p) => p.sessionId);
+        }
+        // No seat higher than the previous first speaker (i.e. they were at
+        // the highest seat) — wrap to the lowest seat.
+        return players.map((p) => p.sessionId);
+      }
+    }
+
     return players.map((p) => p.sessionId);
   }
 
@@ -978,6 +1078,27 @@ export class Engine {
   }
 
   /**
+   * Enter DAY_BALAGAN from DAY_SPEECHES (Day 2+ only — Day 1 skips BALAGAN
+   * per ADR 0005). Arms the 90s BALAGAN timer; expiry auto-transitions to
+   * DAY_DEFENSE (see `onTimerExpired`), and the host can `skipPhase` to end
+   * the debate early.
+   *
+   * `nominate` is also valid during BALAGAN — the phase guard in
+   * `nominate` already accepts both `DAY_SPEECHES` and `DAY_BALAGAN`.
+   */
+  private enterDayBalagan(): void {
+    this.state.phase = GamePhase.DAY_BALAGAN;
+    this.state.currentSpeakerId = "";
+    this.state.currentDefenseId = "";
+    this.startTimer("BALAGAN");
+    this.logEntry({
+      actorSessionId: "",
+      type: ActionType.PHASE_ADVANCE,
+      payload: { event: "balagan_started" },
+    });
+  }
+
+  /**
    * Enter DAY_VOTING from DAY_DEFENSE. Resets the vote buffer to prepare for
    * a fresh round; clients see DAY_VOTING and may now submit votes.
    */
@@ -1013,6 +1134,10 @@ export class Engine {
     this.defenseOrder = [];
     this.currentDefenseIndex = -1;
     this.votes.clear();
+    // `firstSpeakerId` and `firstSpeakerNominated` are intentionally NOT
+    // reset here — `firstSpeakerId` carries across days so Day N+1's
+    // rotation can anchor on Day N's first speaker. `firstSpeakerNominated`
+    // is reset by `startSpeeches` for the new day.
   }
 
   private logEntry(entry: Omit<ActionLogEntry, "id" | "timestamp" | "phase" | "dayCount" | "nightStep">): void {
@@ -1045,6 +1170,15 @@ export class Engine {
    */
   _setLastHealedForTest(doctorSessionId: string, targetId: string): void {
     this.lastHealed.set(doctorSessionId, targetId);
+  }
+
+  /**
+   * Test-only: pin the previous day's first speaker. Used by the
+   * wrap-around rotation test (ticket 07) to set up `firstSpeakerId` to a
+   * specific player without driving a full day cycle.
+   */
+  _setFirstSpeakerIdForTest(sessionId: string): void {
+    this.firstSpeakerId = sessionId;
   }
 
   // ─── Phase timers + host overrides (ticket 04) ─────────────────────────
@@ -1113,8 +1247,10 @@ export class Engine {
         this.nextDefense();
         break;
       case "BALAGAN":
+        // Day 2+ inserts BALAGAN between speeches and defense; its expiry
+        // advances into DAY_DEFENSE.
         this.phaseTimer = null;
-        // Day 1 skips BALAGAN. Ticket 07 owns the entry/exit wiring.
+        this.enterDayDefense();
         break;
       case "MAFIA_WINDOW":
         // Spec: if no victim by the deadline, the phase pauses indefinitely.
@@ -1194,9 +1330,13 @@ export class Engine {
         this.nextDefense();
         break;
       case "MAFIA_WINDOW":
+        // No phase to jump to inside NIGHT step MAFIA — the host must
+        // submit a victim or hold the pause.
+        break;
       case "BALAGAN":
-        // No phase to jump to; the spec leaves the host without an
-        // explicit advance inside NIGHT step MAFIA / BALAGAN skip.
+        // Day 2+ inserts BALAGAN between speeches and defense; skipping
+        // jumps straight to DAY_DEFENSE.
+        this.enterDayDefense();
         break;
     }
   }
