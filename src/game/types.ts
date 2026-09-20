@@ -132,8 +132,8 @@ export interface NightResolution {
 
 /**
  * Cause of death fired through the engine's `onPlayerDied` seam. The seam is
- * a single subscription; the room uses it to react to elimination (currently
- * logging and victory checks — those are follow-up tickets). Day-cycle
+ * the single observation point for every way a player leaves the living, and
+ * is also where the engine runs the victory check (ticket 09). Day-cycle
  * elimination fires `VOTE_ELIMINATION`; night deaths use `MAFIA_KILL`;
  * disconnect declarations use `DECLARED_DEAD`; host moderation (ticket 06)
  * uses `KICKED`.
@@ -144,6 +144,31 @@ export type DeathCause =
   | "DECLARED_DEAD"
   | "KICKED";
 
+/**
+ * Ticket 09: how the game ended. Civilian victory — all blacks (Mafia + Don)
+ * are dead. Mafia victory — living blacks ≥ living reds.
+ */
+export type VictoryReason = "CIVILIAN_VICTORY" | "MAFIA_VICTORY";
+
+/**
+ * Ticket 09: the outcome of the victory check. `winner` is the team that
+ * wins; `reason` says which condition triggered it.
+ */
+export interface GameOverResult {
+  winner: Team;
+  reason: VictoryReason;
+}
+
+/**
+ * Ticket 09: one player's revealed identity for the GAME_OVER reveal. The
+ * reveal travels as a private message to every client (ADR 0004 — the public
+ * schema never carries roles, even after the game ends).
+ */
+export interface RoleReveal {
+  sessionId: string;
+  role: Role;
+  team: Team;
+}
 /**
  * Result of resolving a day cycle's voting round (one `resolveVoting` call —
  * including each revote round; ticket 08). The engine applies this to the

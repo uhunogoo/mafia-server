@@ -3,7 +3,7 @@ import { MafiaState, Player } from "../src/rooms/schema/MafiaState.js";
 import { GamePhase, NightStep, Role, Team } from "../src/rooms/schema/enums.js";
 import { Engine } from "../src/game/Engine.js";
 import { PhaseTimer } from "../src/game/PhaseTimer.js";
-import { EngineErrorCode, type DeathCause } from "../src/game/types.js";
+import { EngineErrorCode, type DeathCause, type GameOverResult } from "../src/game/types.js";
 
 /**
  * Helper: build a fresh MafiaState populated with `count` non-host players
@@ -1516,7 +1516,7 @@ describe("PhaseTimer (pure)", () => {
     const t = new PhaseTimer("DEFENSE_TURN", 30_000, [], 0);
     t.tick(5_000);
     t.pause(5_000);
-    const snap = t.snapshot();
+    const snap = t.snapshot(5_000);
     assert.strictEqual(snap.mode, "DEFENSE_TURN");
     assert.strictEqual(snap.durationMs, 30_000);
     assert.strictEqual(snap.remainingMs, 25_000);
@@ -1676,7 +1676,7 @@ describe("Engine — phase-timer lifecycle", () => {
     engine.startSpeeches();
     engine.nominate("p0", "p6");
     while (engine.state.phase !== GamePhase.DAY_DEFENSE) engine.nextSpeaker();
-    while (engine.state.phase !== GamePhase.DAY_VOTING) engine.nextDefense();
+    while ((engine.state.phase as GamePhase) !== GamePhase.DAY_VOTING) engine.nextDefense();
     assert.strictEqual(engine.getPhaseTimer(), null, "no timer in DAY_VOTING");
   });
 });
@@ -1904,7 +1904,7 @@ describe("Engine — disconnect pause + declareDead (ticket 05)", () => {
     engine.startSpeeches();
     engine.nominate("p0", "p6");
     while (engine.state.phase !== GamePhase.DAY_DEFENSE) engine.nextSpeaker();
-    while (engine.state.phase !== GamePhase.DAY_VOTING) engine.nextDefense();
+    while ((engine.state.phase as GamePhase) !== GamePhase.DAY_VOTING) engine.nextDefense();
     return { state, engine, now };
   }
 
@@ -2123,7 +2123,7 @@ describe("Engine — disconnect pause + declareDead (ticket 05)", () => {
     engine.startSpeeches();
     engine.nominate("p0", "p6");
     while (engine.state.phase !== GamePhase.DAY_DEFENSE) engine.nextSpeaker();
-    while (engine.state.phase !== GamePhase.DAY_VOTING) engine.nextDefense();
+    while ((engine.state.phase as GamePhase) !== GamePhase.DAY_VOTING) engine.nextDefense();
     assert.strictEqual(engine.state.phase, GamePhase.DAY_VOTING);
 
     assert.throws(() => engine.vote("p3", "p6"), (err: unknown) => {
@@ -3098,5 +3098,352 @@ describe("Engine — private check delivery (ticket 07b)", () => {
       assert.deepStrictEqual(r1, { targetId: "p0", team: Team.BLACK });
       assert.deepStrictEqual(r2, { targetId: "p4", isSheriff: false });
     });
+  });
+});
+
+// ─── Ticket 09: victory + reveal ─────────────────────────────────────────
+
+describe("Engine — victory + reveal (ticket 09)", () => {
+  /**
+   * Fresh 9-player game with deterministic roles:
+   * p0=DON, p1=MAFIA, p2=SHERIFF, p3=DOCTOR, p4..p8=CIVILIAN.
+   * Blacks: p0, p1 (2). Reds: p2..p8 (7).
+   */
+  function setupGame(): { state: MafiaState; engine: Engine } {
+    const state = freshState(9);
+    const engine = new Engine(state);
+    engine.startGame();
+    engine._assignRoleForTest("p0", Role.DON);
+    engine._assignRoleForTest("p1", Role.MAFIA);
+    engine._assignRoleForTest("p2", Role.SHERIFF);
+    engine._assignRoleForTest("p3", Role.DOCTOR);
+    for (let i = 4; i < 9; i++) {
+      engine._assignRoleForTest(`p${i}`, Role.CIVILIAN);
+    }
+    return { state, engine };
+  }
+
+  /** Declare `ids` dead via the disconnect path (missing → declareDead). */
+  function declareDead(engine: Engine, ids: string[]): void {
+    for (const id of ids) {
+      engine.pauseForMissing(id);
+      engine.declareDead("host", id);
+    }
+  }
+
+  it("checkVictory returns null while both teams have living members", () => {
+    const { engine } = setupGame();
+    assert.strictEqual(engine.checkVictory(), null);
+    assert.strictEqual(engine.getGameOverResult(), null);
+  });
+
+  it("checkVictory returns null before roles are assigned", () => {
+    const state = freshState(9);
+    const engine = new Engine(state);
+    assert.strictEqual(engine.checkVictory(), null);
+  });
+
+  it("civilian victory: ejecting every black ends the game immediately", () => {
+    const { state, engine } = setupGame();
+    const gameOver: GameOverResult[] = [];
+    engine.setOnGameOver((r) => gameOver.push(r));
+
+    engine.kick("host", "p0", "role card");
+    assert.strictEqual(state.phase, GamePhase.NIGHT, "one black left — the game continues");
+    assert.strictEqual(engine.getGameOverResult(), null);
+
+    engine.kick("host", "p1", "role card");
+    assert.strictEqual(state.phase, GamePhase.GAME_OVER);
+    assert.deepStrictEqual(engine.getGameOverResult(), {
+      winner: Team.RED,
+      reason: "CIVILIAN_VICTORY",
+    });
+    assert.strictEqual(gameOver.length, 1, "onGameOver fired exactly once");
+    assert.deepStrictEqual(gameOver[0], { winner: Team.RED, reason: "CIVILIAN_VICTORY" });
+  });
+
+  it("civilian victory via vote eliminations across two days (the 'kill all mafia' path)", () => {
+    const { state, engine } = setupGame();
+    const gameOver: GameOverResult[] = [];
+    engine.setOnGameOver((r) => gameOver.push(r));
+
+    // Night 1 passes with no kill; the day cycle begins.
+    engine.resolveNight();
+
+    // Day 1: the Don (p0, first speaker) self-nominates; everyone votes p0.
+    engine.startSpeeches();
+    engine.nominate("p0", "p0");
+    const order1 = engine.getSpeakingOrder();
+    for (let i = 0; i < order1.length; i++) engine.nextSpeaker();
+    const dOrder1 = engine.getDefenseOrder();
+    for (let i = 0; i < dOrder1.length; i++) engine.nextDefense();
+    for (const id of order1) engine.vote(id, "p0");
+    engine.resolveVoting();
+    assert.strictEqual(state.phase, GamePhase.NIGHT);
+    assert.strictEqual(state.players.get("p0")!.isAlive, false);
+    assert.strictEqual(engine.getGameOverResult(), null, "one black left — no victory yet");
+
+    // Night 2: the mafia kills p8; no heal.
+    engine.mafiaKill("host", "p8");
+    engine.resolveNight();
+    assert.strictEqual(state.phase, GamePhase.DAY_ANNOUNCEMENT);
+    assert.strictEqual(state.dayCount, 2);
+    assert.strictEqual(state.died, "p8");
+
+    // Day 2: the first speaker is p1 (seat after day 1's p0); the first-word
+    // rule requires them to nominate — they nominate themselves. Everyone
+    // alive votes p1, the last black.
+    engine.startSpeeches();
+    engine.nominate("p1", "p1");
+    const order2 = engine.getSpeakingOrder();
+    for (let i = 0; i < order2.length; i++) engine.nextSpeaker();
+    assert.strictEqual(state.phase, GamePhase.DAY_BALAGAN, "day 2 inserts BALAGAN");
+    engine.skipPhase("host");
+    const dOrder2 = engine.getDefenseOrder();
+    for (let i = 0; i < dOrder2.length; i++) engine.nextDefense();
+    for (const id of order2) engine.vote(id, "p1");
+    engine.resolveVoting();
+
+    assert.strictEqual(state.phase, GamePhase.GAME_OVER, "civilian victory ends the game mid-vote");
+    assert.deepStrictEqual(engine.getGameOverResult(), {
+      winner: Team.RED,
+      reason: "CIVILIAN_VICTORY",
+    });
+    assert.strictEqual(gameOver.length, 1);
+    assert.strictEqual(state.players.get("p1")!.isAlive, false);
+    assert.strictEqual(engine.getPhaseTimer(), null, "no mafia window armed after game over");
+  });
+
+  it("mafia victory at parity fires immediately, mid-day (vote elimination)", () => {
+    const { state, engine } = setupGame();
+    const gameOver: GameOverResult[] = [];
+    engine.setOnGameOver((r) => gameOver.push(r));
+
+    // Four reds declared dead during Night 1: reds drop from 7 to 3.
+    // Blacks 2, reds 3 — still no victory.
+    declareDead(engine, ["p2", "p3", "p4", "p5"]);
+    assert.strictEqual(engine.getGameOverResult(), null);
+
+    // Night 1 passes with no kill; the day cycle begins.
+    engine.resolveNight();
+
+    // Day 1: p0 (first speaker) nominates p6 (red); everyone alive votes p6.
+    engine.startSpeeches();
+    engine.nominate("p0", "p6");
+    const order = engine.getSpeakingOrder(); // p0, p1, p6, p7, p8
+    assert.strictEqual(order.length, 5);
+    for (let i = 0; i < order.length; i++) engine.nextSpeaker();
+    const dOrder = engine.getDefenseOrder();
+    for (let i = 0; i < dOrder.length; i++) engine.nextDefense();
+    for (const id of order) engine.vote(id, "p6");
+    engine.resolveVoting();
+
+    // p6 was red → reds drop to 2, blacks 2 → parity → mafia victory, and
+    // the game does NOT fall through to NIGHT.
+    assert.strictEqual(state.phase, GamePhase.GAME_OVER);
+    assert.deepStrictEqual(engine.getGameOverResult(), {
+      winner: Team.BLACK,
+      reason: "MAFIA_VICTORY",
+    });
+    assert.strictEqual(gameOver.length, 1);
+    assert.strictEqual(state.players.get("p6")!.isAlive, false);
+    assert.strictEqual(engine.getPhaseTimer(), null, "no mafia window armed after a mid-day game over");
+  });
+
+  it("a night kill that reaches parity ends the game without entering DAY_ANNOUNCEMENT", () => {
+    const { state, engine } = setupGame();
+
+    // Four reds declared dead: blacks 2, reds 3.
+    declareDead(engine, ["p2", "p3", "p4", "p5"]);
+
+    // The mafia kills a fifth red. Resolution runs the victory check:
+    // reds drop to 2 → parity → GAME_OVER right here.
+    engine.mafiaKill("host", "p6");
+    const res = engine.resolveNight();
+
+    assert.strictEqual(res.died, "p6");
+    assert.strictEqual(state.died, "p6");
+    assert.strictEqual(state.phase, GamePhase.GAME_OVER, "no DAY_ANNOUNCEMENT after a game-ending night");
+    assert.strictEqual(state.dayCount, 0, "dayCount never bumped — the day never started");
+    assert.deepStrictEqual(engine.getGameOverResult(), {
+      winner: Team.BLACK,
+      reason: "MAFIA_VICTORY",
+    });
+  });
+
+  it("a tie-arbitration kick that ejects the last black ends the game instead of restarting the revote", () => {
+    const { state, engine } = setupGame();
+    engine.state.revoteCap = 1;
+
+    // The Don is declared dead during the night: p1 (Mafia) is the last black.
+    declareDead(engine, ["p0"]);
+
+    // Night 1 passes with no kill; the day cycle begins.
+    engine.resolveNight();
+
+    // Day 1 → 4-way tie among p5..p8 (2 votes each), round 2 repeats it, the
+    // cap (1) is exhausted → the host must arbitrate.
+    engine.startSpeeches();
+    for (const target of ["p5", "p6", "p7", "p8"]) engine.nominate("p1", target);
+    const order = engine.getSpeakingOrder();
+    for (let i = 0; i < order.length; i++) engine.nextSpeaker();
+    const dOrder = engine.getDefenseOrder();
+    for (let i = 0; i < dOrder.length; i++) engine.nextDefense();
+    const castTie = () => {
+      engine.vote("p1", "p5");
+      engine.vote("p2", "p5");
+      engine.vote("p3", "p6");
+      engine.vote("p4", "p6");
+      engine.vote("p5", "p7");
+      engine.vote("p6", "p7");
+      engine.vote("p7", "p8");
+      engine.vote("p8", "p8");
+    };
+    castTie();
+    assert.strictEqual(engine.resolveVoting().outcome, "revote");
+    castTie();
+    assert.strictEqual(engine.resolveVoting().outcome, "host-decision");
+    assert.strictEqual(engine.getRevoteCount(), 1);
+
+    // The host kicks p1 — the last black, not a tied leader. Civilian
+    // victory fires inside the kick's death funnel; the engine must NOT
+    // restart the revote afterwards.
+    engine.resolveTieByKick("host", "p1", "suspected stall");
+
+    assert.strictEqual(state.phase, GamePhase.GAME_OVER);
+    assert.deepStrictEqual(engine.getGameOverResult(), {
+      winner: Team.RED,
+      reason: "CIVILIAN_VICTORY",
+    });
+    assert.strictEqual(engine.getPendingTieDecision(), null, "arbitration cleared by game over");
+    assert.strictEqual(engine.getRevoteCount(), 1, "no new revote started after game over");
+  });
+
+  it("the GAME_OVER reveal carries every player's role while the schema stays role-free", () => {
+    const { state, engine } = setupGame();
+    engine.kick("host", "p0", "role card");
+    engine.kick("host", "p1", "role card");
+    assert.strictEqual(state.phase, GamePhase.GAME_OVER);
+
+    const reveal = engine.getRoleReveal();
+    assert.strictEqual(reveal.length, 9, "every non-host player is revealed (the host has no role)");
+    const byId = new Map(reveal.map((r) => [r.sessionId, r]));
+    assert.deepStrictEqual(byId.get("p0"), { sessionId: "p0", role: Role.DON, team: Team.BLACK });
+    assert.deepStrictEqual(byId.get("p1"), { sessionId: "p1", role: Role.MAFIA, team: Team.BLACK });
+    assert.deepStrictEqual(byId.get("p2"), { sessionId: "p2", role: Role.SHERIFF, team: Team.RED });
+    assert.deepStrictEqual(byId.get("p3"), { sessionId: "p3", role: Role.DOCTOR, team: Team.RED });
+    assert.deepStrictEqual(byId.get("p4"), { sessionId: "p4", role: Role.CIVILIAN, team: Team.RED });
+
+    // ADR 0004 holds even after GAME_OVER: the public schema never carries
+    // roles — the reveal travels as a private message.
+    for (const p of state.players.values()) {
+      assert.strictEqual((p as unknown as { role?: unknown }).role, undefined);
+      assert.strictEqual((p as unknown as { team?: unknown }).team, undefined);
+    }
+  });
+
+  it("the state locks after GAME_OVER — no further actions accepted", () => {
+    const { state, engine } = setupGame();
+    engine.kick("host", "p0", "role card");
+    engine.kick("host", "p1", "role card");
+    assert.strictEqual(state.phase, GamePhase.GAME_OVER);
+
+    const expectWrongPhase = (fn: () => void) => {
+      assert.throws(fn, (err: unknown) => {
+        return (err as { code: string }).code === EngineErrorCode.WRONG_PHASE;
+      });
+    };
+
+    // Night actions.
+    expectWrongPhase(() => engine.mafiaKill("host", "p4"));
+    expectWrongPhase(() => engine.donCheck("p0", "p4"));
+    expectWrongPhase(() => engine.sheriffCheck("p2", "p4"));
+    expectWrongPhase(() => engine.doctorHeal("p3", "p4"));
+    expectWrongPhase(() => engine.resolveNight());
+
+    // Day actions.
+    expectWrongPhase(() => engine.startSpeeches());
+    expectWrongPhase(() => engine.nextSpeaker());
+    expectWrongPhase(() => engine.nextDefense());
+    expectWrongPhase(() => engine.nominate("p4", "p5"));
+    expectWrongPhase(() => engine.vote("p4", "p5"));
+    expectWrongPhase(() => engine.resolveVoting());
+
+    // Host moderation and the death funnel are locked too.
+    expectWrongPhase(() => engine.kick("host", "p4", "late kick"));
+    expectWrongPhase(() => engine.declareDead("host", "p4"));
+
+    // Pings are rejected by their own GAME_OVER guard.
+    expectWrongPhase(() => engine.ping("p4", "p5"));
+
+    // The game cannot be restarted.
+    assert.throws(() => engine.startGame(), (err: unknown) => {
+      return (err as { code: string }).code === EngineErrorCode.GAME_LOCKED;
+    });
+
+    // Foul remains available by design (a warning after the game is still a
+    // warning) and changes no game state.
+    engine.foul("host", "p4", "post-game etiquette");
+    assert.strictEqual(state.phase, GamePhase.GAME_OVER);
+  });
+
+  it("onGameOver fires exactly once even when the winning death and a subsequent lock-bypass coincide", () => {
+    const { engine } = setupGame();
+    let count = 0;
+    engine.setOnGameOver(() => {
+      count += 1;
+    });
+    engine.kick("host", "p0", "one");
+    engine.kick("host", "p1", "two");
+    assert.strictEqual(count, 1);
+  });
+
+  it("the death seam still fires for every death, alongside the victory seam", () => {
+    const { engine } = setupGame();
+    const deaths: { id: string; cause: DeathCause }[] = [];
+    engine.setOnPlayerDied((id, cause) => deaths.push({ id, cause }));
+    let gameOverCount = 0;
+    engine.setOnGameOver(() => {
+      gameOverCount += 1;
+    });
+
+    engine.kick("host", "p0", "one");
+    engine.kick("host", "p1", "two");
+
+    assert.deepStrictEqual(deaths, [
+      { id: "p0", cause: "KICKED" },
+      { id: "p1", cause: "KICKED" },
+    ]);
+    assert.strictEqual(gameOverCount, 1);
+  });
+
+  it("endGame dismisses a pending missing-player pause so GAME_OVER state is clean", () => {
+    const { state, engine } = setupGame();
+    // p3 (a red) drops mid-phase; the host instead kicks both blacks — the
+    // game ends while p3 is still flagged missing.
+    engine.pauseForMissing("p3");
+    assert.strictEqual(state.players.get("p3")!.isMissing, true);
+
+    engine.kick("host", "p0", "role card");
+    assert.strictEqual(state.phase, GamePhase.NIGHT, "the Don is dead but the Mafia lives on");
+    assert.strictEqual(state.players.get("p3")!.isMissing, true, "missing flag survives a non-final death");
+
+    engine.kick("host", "p1", "role card");
+    assert.strictEqual(state.phase, GamePhase.GAME_OVER);
+    assert.strictEqual(state.players.get("p3")!.isMissing, false, "missing flag cleared at game over");
+    assert.deepStrictEqual(engine.getMissingPlayers(), []);
+  });
+
+  it("the game_over event lands in the host action log with winner and reason", () => {
+    const { engine } = setupGame();
+    engine.kick("host", "p0", "one");
+    engine.kick("host", "p1", "two");
+
+    const last = engine.getActionLog().at(-1)!;
+    assert.strictEqual(last.type, "PHASE_ADVANCE");
+    assert.strictEqual((last.payload as { event: string }).event, "game_over");
+    assert.strictEqual((last.payload as { winner: Team }).winner, Team.RED);
+    assert.strictEqual((last.payload as { reason: string }).reason, "CIVILIAN_VICTORY");
+    assert.strictEqual(last.phase, GamePhase.GAME_OVER);
   });
 });

@@ -4,13 +4,13 @@
 
 **Blocked by:** 03, 06, 07, 08.
 
-**Status:** ready-for-agent
+**Status:** complete
 
-- [ ] Engine exposes `onPlayerDied(player)` as the single seam for all death sources.
-- [ ] Night resolution (from ticket 01), voting (from ticket 03), kick (from ticket 06), and `declareDead` (from ticket 05) all call `onPlayerDied`.
-- [ ] Phases do not implement their own victory checks.
-- [ ] Civilian victory: all blacks (Mafia + Don) dead → `GAME_OVER`.
-- [ ] Mafia victory: living blacks ≥ living reds → `GAME_OVER` (immediate, even mid-day).
-- [ ] At `GAME_OVER`, every player's role is broadcast to every other player.
-- [ ] The engine state is locked after `GAME_OVER` (no further actions accepted).
-- [ ] Test: kill all mafia → `GAME_OVER` with civilian victory; reach parity → `GAME_OVER` with mafia victory mid-day; `GAME_OVER` state has all roles revealed; no actions accepted after `GAME_OVER`.
+- [x] Engine exposes `onPlayerDied(player)` as the single seam for all death sources.
+- [x] Night resolution (from ticket 01), voting (from ticket 03), kick (from ticket 06), and `declareDead` (from ticket 05) all call `onPlayerDied`.
+- [x] Phases do not implement their own victory checks.
+- [x] Civilian victory: all blacks (Mafia + Don) dead → `GAME_OVER`.
+- [x] Mafia victory: living blacks ≥ living reds → `GAME_OVER` (immediate, even mid-day).
+- [x] At `GAME_OVER`, every player's role is broadcast to every other player.
+- [x] The engine state is locked after `GAME_OVER` (no further actions accepted).
+- [x] Test: kill all mafia → `GAME_OVER` with civilian victory; reach parity → `GAME_OVER` with mafia victory mid-day; `GAME_OVER` state has all roles revealed; no actions accepted after `GAME_OVER`.

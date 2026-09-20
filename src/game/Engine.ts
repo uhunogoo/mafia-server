@@ -9,10 +9,12 @@ import {
   DonCheckResult,
   EngineError,
   EngineErrorCode,
+  GameOverResult,
   NightResolution,
   PingRecord,
   PlayerIdentity,
   ROLE_DISTRIBUTION,
+  RoleReveal,
   SheriffCheckResult,
   SUPPORTED_PLAYER_COUNTS,
   VoteOutcome,
@@ -125,6 +127,21 @@ function shuffle<T>(items: readonly T[]): T[] {
  *    immediate pardon with no host step
  *  - room creation accepts `revoteCap` / `revoteBehavior` (wired in MafiaRoom)
  *
+ * Slice-9 (ticket 09) adds victory detection + the final reveal:
+ *  - every death source funnels through one internal point
+ *    (`handlePlayerDied`), which runs `checkVictory` — phases never
+ *    implement their own victory checks
+ *  - civilian victory when all blacks (Mafia + Don) are dead; mafia victory
+ *    when living blacks ≥ living reds (fires immediately, even mid-day)
+ *  - `endGame` transitions to GAME_OVER, drops the phase timer and any
+ *    pending tie arbitration, logs `game_over`, and fires the `onGameOver`
+ *    seam so the room can broadcast the role reveal to every client (the
+ *    reveal travels as a private message — the schema stays role-free, ADR
+ *    0004)
+ *  - the night→day and day→night transitions are skipped when the death
+ *    ended the game, and the state locks: every action is rejected after
+ *    GAME_OVER
+ *
  * The engine never touches the network; the room translates `EngineError`
  * into player-visible messages and `client.send` for private role reveals.
  */
@@ -218,12 +235,28 @@ export class Engine {
   private firstSpeakerNominated = false;
 
   /**
-   * Optional seam fired whenever a player dies. Day-cycle elimination calls it
-   * with `VOTE_ELIMINATION`; night mafia kills call `MAFIA_KILL`; ticket 05
-   * adds `DECLARED_DEAD` for host-declared dead on disconnect. The room uses
-   * this hook to run victory checks and host notifications.
+   * Optional seam fired whenever a player dies. Every death source routes
+   * through `handlePlayerDied`, which runs the victory check (ticket 09) and
+   * then fires this callback. Day-cycle elimination calls it with
+   * `VOTE_ELIMINATION`; night mafia kills call `MAFIA_KILL`;
+   * host-declared dead on disconnect calls `DECLARED_DEAD`; kicks call
+   * `KICKED`. The room uses this hook for host notifications.
    */
   private onPlayerDied: ((sessionId: string, cause: DeathCause) => void) | null = null;
+
+  /**
+   * Ticket 09: optional seam fired exactly once when the victory check ends
+   * the game. The room subscribes to broadcast the final role reveal to
+   * every connected client. Pass `null` to unsubscribe.
+   */
+  private onGameOver: ((result: GameOverResult) => void) | null = null;
+
+  /**
+   * Ticket 09: the outcome that ended the game, or `null` while the game is
+   * still running. Set by `endGame`; readable for tests and for a host UI
+   * that loads after the game already ended.
+   */
+  private gameOverResult: GameOverResult | null = null;
 
   /**
    * SessionIds of players who have dropped but not yet been declared dead.
@@ -621,14 +654,19 @@ export class Engine {
 
     this.resetNightActions();
 
-    // Mark the victim dead in the public schema and fire the seam. Doing
-    // this here (not at DAY_ANNOUNCEMENT entry) keeps the seam as a single
-    // observation point for every death cause — vote elimination in
-    // `resolveVoting`, host-declared dead in the upcoming ticket 05.
+    // Mark the victim dead in the public schema and funnel the death through
+    // the single seam — which also runs the victory check (ticket 09): a
+    // night kill can hand the mafia their parity win right here.
     if (died !== "") {
       const target = this.state.players.get(died);
       if (target) target.isAlive = false;
-      this.onPlayerDied?.(died, "MAFIA_KILL");
+      this.handlePlayerDied(died, "MAFIA_KILL");
+    }
+
+    // The game ended on this death — GAME_OVER is terminal, so skip the
+    // day-cycle entry (the phase must not move on from GAME_OVER).
+    if (this.state.phase === GamePhase.GAME_OVER) {
+      return resolution;
     }
 
     // Day-cycle entry: bump dayCount, reset day state, transition phase.
@@ -645,16 +683,140 @@ export class Engine {
 
   /**
    * Register a callback fired whenever a player dies. The room subscribes to
-   * observe elimination so it can run victory checks and host notifications.
-   * Pass `null` to unsubscribe. A single callback overwrites any previous one.
+   * observe elimination so it can push host notifications. Pass `null` to
+   * unsubscribe. A single callback overwrites any previous one.
+   *
+   * The victory check is NOT the subscriber's job — it runs inside the
+   * engine's single death funnel (`handlePlayerDied`, ticket 09) before this
+   * callback fires, so the room always observes post-victory state.
    *
    * `DECLARED_DEAD` is the only cause where the dead flag is set *after* a
-   * disconnect-pause is resolved by the host. The other two causes
-   * (`VOTE_ELIMINATION`, `MAFIA_KILL`) are issued by the day/night cycle
-   * itself.
+   * disconnect-pause is resolved by the host. The other causes
+   * (`VOTE_ELIMINATION`, `MAFIA_KILL`, `KICKED`) are issued by the day/night
+   * cycle or by host moderation.
    */
   setOnPlayerDied(callback: ((sessionId: string, cause: DeathCause) => void) | null): void {
     this.onPlayerDied = callback;
+  }
+
+  /**
+   * Ticket 09: register a callback fired exactly once when the victory check
+   * transitions the game to GAME_OVER. The room uses it to broadcast the
+   * final role reveal (`getRoleReveal()`) to every connected client. Pass
+   * `null` to unsubscribe. A single callback overwrites any previous one.
+   */
+  setOnGameOver(callback: ((result: GameOverResult) => void) | null): void {
+    this.onGameOver = callback;
+  }
+
+  /**
+   * Ticket 09: the outcome that ended the game, or `null` while the game is
+   * still running (victory has not been reached).
+   */
+  getGameOverResult(): GameOverResult | null {
+    return this.gameOverResult ? { ...this.gameOverResult } : null;
+  }
+
+  /**
+   * Ticket 09: victory detection. Pure with respect to the engine's identity
+   * map and the public schema's alive flags — no mutation, no side effects.
+   *
+   * - Civilian victory: every black (Mafia + Don) is dead → RED wins.
+   * - Mafia victory: living blacks ≥ living reds → BLACK wins. Checked
+   *   second, so a wipeout of one side always resolves as that side's loss
+   *   even in the degenerate all-dead case.
+   *
+   * Returns `null` while neither condition holds (or before roles are
+   * assigned — the host has no identity and is never counted).
+   */
+  checkVictory(): GameOverResult | null {
+    if (this.identities.size === 0) return null;
+
+    let livingBlacks = 0;
+    let livingReds = 0;
+    for (const [sessionId, identity] of this.identities) {
+      const player = this.state.players.get(sessionId);
+      if (!player || !player.isAlive) continue;
+      if (identity.team === Team.BLACK) {
+        livingBlacks += 1;
+      } else {
+        livingReds += 1;
+      }
+    }
+
+    if (livingBlacks === 0) {
+      return { winner: Team.RED, reason: "CIVILIAN_VICTORY" };
+    }
+    if (livingBlacks >= livingReds) {
+      return { winner: Team.BLACK, reason: "MAFIA_VICTORY" };
+    }
+    return null;
+  }
+
+  /**
+   * Ticket 09: every player's role + team for the GAME_OVER reveal. Sent by
+   * the room as a private `gameOver` message to each client — never written
+   * to the public schema (ADR 0004 holds even after the game ends). The host
+   * has no identity and is not included.
+   */
+  getRoleReveal(): RoleReveal[] {
+    const reveal: RoleReveal[] = [];
+    for (const [sessionId, identity] of this.identities) {
+      reveal.push({ sessionId, role: identity.role, team: identity.team });
+    }
+    return reveal;
+  }
+
+  /**
+   * Ticket 09: the single funnel every death source passes through. Runs the
+   * victory check exactly here (so victory logic lives in one place and no
+   * phase implements its own), then fires the room's death callback.
+   *
+   * The victory check runs BEFORE the death callback so the room observes
+   * the final (GAME_OVER) state when the death notification arrives.
+   */
+  private handlePlayerDied(sessionId: string, cause: DeathCause): void {
+    this.checkVictoryAndEndGame();
+    this.onPlayerDied?.(sessionId, cause);
+  }
+
+  /**
+   * Ticket 09: run the victory check and, on a win, end the game. No-op when
+   * the game is already over.
+   */
+  private checkVictoryAndEndGame(): void {
+    if (this.state.phase === GamePhase.GAME_OVER) return;
+    const result = this.checkVictory();
+    if (result) {
+      this.endGame(result);
+    }
+  }
+
+  /**
+   * Ticket 09: transition to GAME_OVER. Drops the phase timer (GAME_OVER has
+   * none) and any pending host arbitration, clears leftover missing-player
+   * flags (a disconnect pause cannot outlive the game it paused), writes the
+   * `game_over` log entry, and fires the `onGameOver` seam so the room can
+   * reveal every role.
+   */
+  private endGame(result: GameOverResult): void {
+    this.gameOverResult = result;
+    this.state.phase = GamePhase.GAME_OVER;
+    this.clearTimer();
+    this.pendingTieDecision = null;
+    for (const sessionId of this.missing) {
+      const player = this.state.players.get(sessionId);
+      if (player) player.isMissing = false;
+    }
+    this.missing.clear();
+
+    this.logEntry({
+      actorSessionId: "",
+      type: ActionType.PHASE_ADVANCE,
+      payload: { event: "game_over", winner: result.winner, reason: result.reason },
+    });
+
+    this.onGameOver?.(result);
   }
 
   /**
@@ -1044,15 +1206,23 @@ export class Engine {
 
   /**
    * End the day after a vote resolution: mark `eliminatedId` dead (empty
-   * string = auto-pardon), fire the `onPlayerDied` seam, clear transient
-   * day-cycle state (preserving Player.votes so the final tally stays
-   * visible), and transition DAY_VOTING → NIGHT with a fresh mafia window.
+   * string = auto-pardon), funnel the death through the single seam (which
+   * runs the victory check — a mid-day elimination can hand either side the
+   * win, ticket 09), clear transient day-cycle state (preserving Player.votes
+   * so the final tally stays visible), and transition DAY_VOTING → NIGHT with
+   * a fresh mafia window.
    */
   private endDay(eliminatedId: string): void {
     if (eliminatedId !== "") {
       const target = this.state.players.get(eliminatedId);
       if (target) target.isAlive = false;
-      this.onPlayerDied?.(eliminatedId, "VOTE_ELIMINATION");
+      this.handlePlayerDied(eliminatedId, "VOTE_ELIMINATION");
+    }
+
+    // The game ended on this elimination — GAME_OVER is terminal, so skip
+    // the day→night transition (the phase must not move on from GAME_OVER).
+    if (this.state.phase === GamePhase.GAME_OVER) {
+      return;
     }
 
     this.resetDayState({ preserveTallies: true });
@@ -1148,6 +1318,12 @@ export class Engine {
 
     // Ticket 06's path: validation, KICK log entry, KICKED death seam.
     this.kick(hostSessionId, targetId, reason);
+
+    // The kick may have ended the game (ejecting the last black, ticket 09).
+    // GAME_OVER is terminal — there is no revote to restart.
+    if (this.state.phase === GamePhase.GAME_OVER) {
+      return;
+    }
 
     // Restart the revote with one fewer voter: same tied-leader ballot,
     // fresh vote buffer, still DAY_VOTING. (The pardon/force choices clear
@@ -1741,18 +1917,24 @@ export class Engine {
    * Host-only: declare a missing player dead and resume the phase. The
    * player is removed from the missing set, `Player.isAlive` is cleared
    * (so any reconnect attempt will be rebuffed by `requireAlivePlayer`),
-   * and the `onPlayerDied` seam fires with `DECLARED_DEAD` — the same
-   * observation point that handles vote eliminations and mafia kills, so
-   * the future victory-check work in ticket 09 picks up declared-dead
-   * players automatically.
+   * and the death funnels through `handlePlayerDied` with `DECLARED_DEAD` —
+   * the single observation point that also runs the victory check, so a
+   * declaration can hand either side the win (ticket 09).
    *
-   * Guards: requires host, requires `sessionId` to be at the table and
+   * Guards: requires host, requires an active game (the state locks at
+   * GAME_OVER — ticket 09), requires `sessionId` to be at the table and
    * currently missing. Re-declaring an already-dead player is rejected
    * with PLAYER_DEAD; declaring a player who isn't missing is rejected
    * with WRONG_ROLE (the host can only resolve a known disconnect).
    */
   declareDead(hostSessionId: string, sessionId: string): void {
     this.requireHost(hostSessionId);
+    if (this.state.phase === GamePhase.GAME_OVER) {
+      throw new EngineError(
+        EngineErrorCode.WRONG_PHASE,
+        `declareDead requires an active game, currently ${this.state.phase}`,
+      );
+    }
     const player = this.state.players.get(sessionId);
     if (!player) {
       throw new EngineError(
@@ -1783,10 +1965,12 @@ export class Engine {
       payload: { sessionId },
     });
 
-    // Fire the seam BEFORE resuming the timer so any host-side victory
-    // check that wants to inspect post-death state (e.g. did this kill
-    // the last mafia?) sees the public schema already updated.
-    this.onPlayerDied?.(sessionId, "DECLARED_DEAD");
+    // Fire the seam BEFORE resuming the timer so any host-side observer of
+    // post-death state (e.g. did this kill the last mafia?) sees the public
+    // schema already updated. The funnel also runs the victory check — a
+    // declaration can end the game here, in which case endGame has already
+    // dropped the timer and resumePausedTimer becomes a no-op.
+    this.handlePlayerDied(sessionId, "DECLARED_DEAD");
 
     this.resumePausedTimer();
   }
@@ -1868,9 +2052,10 @@ export class Engine {
       payload: { sessionId: targetId, reason },
     });
 
-    // Same seam as mafia kills / vote eliminations / declared-dead: one
-    // observation point for every way a player leaves the living.
-    this.onPlayerDied?.(targetId, "KICKED");
+    // Same funnel as mafia kills / vote eliminations / declared-dead: one
+    // observation point for every way a player leaves the living — and the
+    // place where the victory check runs (ticket 09).
+    this.handlePlayerDied(targetId, "KICKED");
   }
 
   /**

@@ -6,6 +6,7 @@ import appConfig from "../src/app.config.js";
 import { MafiaState } from "../src/rooms/schema/MafiaState.js";
 import { MafiaRoom } from "../src/rooms/MafiaRoom.js";
 import { Role, GamePhase, NightStep } from "../src/rooms/schema/enums.js";
+import { ActionType } from "../src/game/types.js";
 
 interface Setup {
   room: MafiaRoom;
@@ -1453,8 +1454,8 @@ describe("mafia_room", () => {
     assert.ok(errors.length >= 2, "non-host should be rejected for both actions");
     assert.strictEqual(room.state.players.get(guests[5].sessionId)!.isAlive, true, "no kick happened");
     const logTypes = room.engine.getActionLog().map((e) => e.type);
-    assert.ok(!logTypes.includes("KICK"), "no KICK entry");
-    assert.ok(!logTypes.includes("FOUL"), "no FOUL entry");
+    assert.ok(!logTypes.includes(ActionType.KICK), "no KICK entry");
+    assert.ok(!logTypes.includes(ActionType.FOUL), "no FOUL entry");
   });
 
   // в”Ђв”Ђв”Ђ Ticket 07: Day 2+ BALAGAN + first-word rule (room layer) в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
@@ -2150,7 +2151,7 @@ describe("mafia_room", () => {
     setup.guests[1].onMessage("error", (msg: unknown) => {
       errors.push(String((msg as { message?: string }).message ?? msg));
     });
-    setup.guests[1].onMessage("sheriffCheckResult", (p: unknown) => {
+    setup.guests[1].onMessage("sheriffCheckResult", () => {
       errors.push("unexpected sheriffCheckResult");
     });
 
@@ -2232,6 +2233,337 @@ describe("mafia_room", () => {
     // Allow any cross-routed messages to flush.
     await new Promise((r) => setTimeout(r, 50));
     assert.strictEqual(crossLeaks.length, 0, "no cross-leak between check results");
+  });
+  });
+
+  // ─── Ticket 09: game over + reveal ──────────────────────────────────
+
+  describe("game over + reveal (ticket 09)", () => {
+  /** Subscribe every client to `type`, return per-client arrays. */
+  function captureAll(
+    setup: Setup,
+    type: string,
+  ): { host: unknown[]; guests: unknown[][] } {
+    const host: unknown[] = [];
+    const guests: unknown[][] = setup.guests.map(() => []);
+    setup.host.onMessage(type, (p: unknown) => host.push(p));
+    for (let i = 0; i < setup.guests.length; i++) {
+      setup.guests[i].onMessage(type, (p: unknown) => guests[i].push(p));
+    }
+    return { host, guests };
+  }
+
+  /** Register an error collector on every client. */
+  function collectErrors(setup: Setup): { host: string[]; guests: string[][] } {
+    const host: string[] = [];
+    const guests: string[][] = setup.guests.map(() => []);
+    setup.host.onMessage("error", (msg: unknown) =>
+      host.push(String((msg as { message?: string }).message ?? msg)),
+    );
+    for (let i = 0; i < setup.guests.length; i++) {
+      setup.guests[i].onMessage("error", (msg: unknown) =>
+        guests[i].push(String((msg as { message?: string }).message ?? msg)),
+      );
+    }
+    return { host, guests };
+  }
+
+  /** Simulate a drop and have the host declare the player dead. */
+  async function dropAndDeclare(setup: Setup, guestIndex: number): Promise<void> {
+    const { room, host, guests } = setup;
+    (room as unknown as { _simulateDropForTest(s: string): void })._simulateDropForTest(
+      guests[guestIndex].sessionId,
+    );
+    await room.waitForNextPatch();
+    host.send("declareDead", { sessionId: guests[guestIndex].sessionId });
+    await room.waitForNextPatch();
+  }
+
+  it("voting out both blacks across two days ends the game with civilian victory and broadcasts the reveal", async () => {
+    const setup = await setupRoom(colyseus, 10);
+    const { room, host, guests } = setup;
+
+    const gameOver = captureAll(setup, "gameOver");
+    const errors = collectErrors(setup);
+
+    // Day 1: resolve the kill-free night, then vote out the Don (guests[0],
+    // the first speaker) via self-nomination.
+    host.send("resolveNight");
+    await room.waitForNextPatch();
+    assert.strictEqual(room.state.phase, GamePhase.DAY_ANNOUNCEMENT);
+
+    host.send("startSpeeches");
+    await room.waitForNextPatch();
+    guests[0].send("nominate", { targetId: guests[0].sessionId });
+    await room.waitForNextPatch();
+
+    const order1 = room.engine.getSpeakingOrder();
+    for (let i = 0; i < order1.length; i++) {
+      host.send("nextSpeaker");
+      await room.waitForNextPatch();
+    }
+    assert.strictEqual(room.state.phase, GamePhase.DAY_DEFENSE);
+    const dOrder1 = room.engine.getDefenseOrder();
+    for (let i = 0; i < dOrder1.length; i++) {
+      host.send("nextDefense");
+      await room.waitForNextPatch();
+    }
+    for (const g of guests) {
+      g.send("vote", { targetId: guests[0].sessionId });
+      await room.waitForNextPatch();
+    }
+    host.send("resolveVoting");
+    await room.waitForNextPatch();
+
+    assert.strictEqual(room.state.phase, GamePhase.NIGHT, "one black left — the game continues");
+    assert.strictEqual(room.engine.getGameOverResult(), null);
+
+    // Night 2: the mafia kills a red; no heal.
+    host.send("mafiaKill", { targetId: guests[9].sessionId });
+    await room.waitForNextPatch();
+    host.send("resolveNight");
+    await room.waitForNextPatch();
+    assert.strictEqual(room.state.phase, GamePhase.DAY_ANNOUNCEMENT);
+    assert.strictEqual(room.state.dayCount, 2);
+
+    // Day 2: guests[1] (the last black) is the first speaker; the
+    // first-word rule forces a nomination — they nominate themselves.
+    host.send("startSpeeches");
+    await room.waitForNextPatch();
+    assert.strictEqual(room.engine.getCurrentSpeaker(), guests[1].sessionId);
+    guests[1].send("nominate", { targetId: guests[1].sessionId });
+    await room.waitForNextPatch();
+
+    const order2 = room.engine.getSpeakingOrder();
+    for (let i = 0; i < order2.length; i++) {
+      host.send("nextSpeaker");
+      await room.waitForNextPatch();
+    }
+    assert.strictEqual(room.state.phase, GamePhase.DAY_BALAGAN);
+    host.send("skipPhase");
+    await room.waitForNextPatch();
+    const dOrder2 = room.engine.getDefenseOrder();
+    for (let i = 0; i < dOrder2.length; i++) {
+      host.send("nextDefense");
+      await room.waitForNextPatch();
+    }
+    // The eight living guests all vote for the last black.
+    for (let i = 1; i < 9; i++) {
+      guests[i].send("vote", { targetId: guests[1].sessionId });
+      await room.waitForNextPatch();
+    }
+    host.send("resolveVoting");
+    await room.waitForNextPatch();
+    await new Promise((r) => setTimeout(r, 50));
+
+    // Civilian victory, mid-day: the phase must NOT roll into night 3.
+    assert.strictEqual(room.state.phase, GamePhase.GAME_OVER);
+    assert.strictEqual(room.state.dayCount, 2);
+    assert.strictEqual(room.state.players.get(guests[1].sessionId)!.isAlive, false);
+    assert.deepStrictEqual(room.engine.getGameOverResult(), {
+      winner: "RED",
+      reason: "CIVILIAN_VICTORY",
+    });
+
+    // Every client — host included — receives exactly one gameOver message.
+    assert.strictEqual(gameOver.host.length, 1);
+    for (let i = 0; i < guests.length; i++) {
+      assert.strictEqual(gameOver.guests[i].length, 1, `guest ${i} gameOver`);
+    }
+
+    // The reveal carries every role; the schema never does (ADR 0004).
+    const payload = gameOver.guests[0][0] as {
+      winner: string;
+      reason: string;
+      reveal: { sessionId: string; role: Role; team: string }[];
+    };
+    assert.strictEqual(payload.winner, "RED");
+    assert.strictEqual(payload.reason, "CIVILIAN_VICTORY");
+    assert.strictEqual(payload.reveal.length, 10, "every guest is revealed; the host is not");
+    const byId = new Map(payload.reveal.map((r) => [r.sessionId, r]));
+    const expectedRoles: Role[] = [
+      Role.DON, Role.MAFIA, Role.SHERIFF, Role.DOCTOR,
+      Role.CIVILIAN, Role.CIVILIAN, Role.CIVILIAN, Role.CIVILIAN, Role.CIVILIAN, Role.CIVILIAN,
+    ];
+    for (let i = 0; i < guests.length; i++) {
+      const id = guests[i].sessionId;
+      assert.deepStrictEqual(byId.get(id), {
+        sessionId: id,
+        role: expectedRoles[i],
+        team: i < 2 ? "BLACK" : "RED",
+      });
+    }
+    for (const p of room.state.players.values()) {
+      assert.strictEqual((p as unknown as { role?: unknown }).role, undefined);
+      assert.strictEqual((p as unknown as { team?: unknown }).team, undefined);
+    }
+
+    // The whole drive produced no errors on any client.
+    assert.strictEqual(errors.host.length, 0, errors.host.join("; "));
+    for (let i = 0; i < guests.length; i++) {
+      assert.strictEqual(errors.guests[i].length, 0, `guest ${i}: ${errors.guests[i].join("; ")}`);
+    }
+  });
+
+  it("voting to parity ends the game immediately with mafia victory (mid-day)", async () => {
+    const setup = await setupRoom(colyseus, 10);
+    const { room, host, guests } = setup;
+
+    const gameOver = captureAll(setup, "gameOver");
+    const errors = collectErrors(setup);
+
+    // Five reds (guests[2..6]) drop during Night 1 and are declared dead:
+    // blacks 2, reds 3 — no victory yet.
+    for (let i = 2; i <= 6; i++) {
+      await dropAndDeclare(setup, i);
+    }
+    assert.strictEqual(room.state.phase, GamePhase.NIGHT);
+    assert.strictEqual(room.engine.getGameOverResult(), null);
+
+    // Night 1 passes kill-free; day 1 begins.
+    host.send("resolveNight");
+    await room.waitForNextPatch();
+    host.send("startSpeeches");
+    await room.waitForNextPatch();
+    guests[0].send("nominate", { targetId: guests[7].sessionId });
+    await room.waitForNextPatch();
+
+    const order = room.engine.getSpeakingOrder();
+    assert.strictEqual(order.length, 5, "only guests[0,1,7,8,9] remain alive");
+    for (let i = 0; i < order.length; i++) {
+      host.send("nextSpeaker");
+      await room.waitForNextPatch();
+    }
+    const dOrder = room.engine.getDefenseOrder();
+    for (let i = 0; i < dOrder.length; i++) {
+      host.send("nextDefense");
+      await room.waitForNextPatch();
+    }
+    // Everyone alive votes out guests[7] (red): reds drop to 2 — parity.
+    for (const g of [guests[0], guests[1], guests[7], guests[8], guests[9]]) {
+      g.send("vote", { targetId: guests[7].sessionId });
+      await room.waitForNextPatch();
+    }
+    host.send("resolveVoting");
+    await room.waitForNextPatch();
+    await new Promise((r) => setTimeout(r, 50));
+
+    assert.strictEqual(room.state.phase, GamePhase.GAME_OVER, "parity ends the game mid-day");
+    assert.strictEqual(room.state.dayCount, 1, "no night 2 was entered");
+    assert.deepStrictEqual(room.engine.getGameOverResult(), {
+      winner: "BLACK",
+      reason: "MAFIA_VICTORY",
+    });
+    assert.strictEqual(gameOver.host.length, 1);
+    for (let i = 0; i < guests.length; i++) {
+      assert.strictEqual(gameOver.guests[i].length, 1, `guest ${i} gameOver`);
+    }
+    const payload = gameOver.guests[4][0] as { winner: string; reason: string; reveal: unknown[] };
+    assert.strictEqual(payload.winner, "BLACK");
+    assert.strictEqual(payload.reason, "MAFIA_VICTORY");
+    assert.strictEqual(payload.reveal.length, 10);
+
+    assert.strictEqual(errors.host.length, 0, errors.host.join("; "));
+    for (let i = 0; i < guests.length; i++) {
+      assert.strictEqual(errors.guests[i].length, 0, `guest ${i}: ${errors.guests[i].join("; ")}`);
+    }
+  });
+
+  it("no actions are accepted after GAME_OVER", async () => {
+    const setup = await setupRoom(colyseus, 10);
+    const { room, host, guests } = setup;
+
+    const gameOver = captureAll(setup, "gameOver");
+
+    // The quickest route to GAME_OVER: both blacks drop and are declared
+    // dead during Night 1.
+    await dropAndDeclare(setup, 0);
+    assert.strictEqual(room.engine.getGameOverResult(), null, "the Don died but the Mafia lives");
+    await dropAndDeclare(setup, 1);
+    await new Promise((r) => setTimeout(r, 50));
+
+    assert.strictEqual(room.state.phase, GamePhase.GAME_OVER);
+    assert.deepStrictEqual(room.engine.getGameOverResult(), {
+      winner: "RED",
+      reason: "CIVILIAN_VICTORY",
+    });
+    assert.strictEqual(gameOver.host.length, 1, "the reveal was broadcast");
+
+    const guestErrors: string[] = [];
+    guests[4].onMessage("error", (msg: unknown) =>
+      guestErrors.push(String((msg as { message?: string }).message ?? msg)),
+    );
+    const hostErrors: string[] = [];
+    host.onMessage("error", (msg: unknown) =>
+      hostErrors.push(String((msg as { message?: string }).message ?? msg)),
+    );
+
+    const phaseError = "Зараз не та фаза для цієї дії";
+
+    // Night actions are locked (the host submits them on the players' behalf).
+    host.send("mafiaKill", { targetId: guests[5].sessionId });
+    await room.waitForNextPatch();
+    // Day actions are locked for live players.
+    guests[4].send("vote", { targetId: guests[5].sessionId });
+    await room.waitForNextPatch();
+    guests[4].send("nominate", { targetId: guests[5].sessionId });
+    await room.waitForNextPatch();
+
+    // Host moderation is locked too.
+    host.send("startSpeeches");
+    await room.waitForNextPatch();
+    host.send("kick", { sessionId: guests[4].sessionId, reason: "post-game" });
+    await room.waitForNextPatch();
+
+    // The game cannot be restarted.
+    host.send("startGame");
+    await room.waitForNextPatch();
+
+    assert.deepStrictEqual(guestErrors, [phaseError, phaseError]);
+    assert.deepStrictEqual(hostErrors, [
+      phaseError,
+      phaseError,
+      phaseError,
+      "Game is already in progress",
+    ]);
+
+    // State is untouched: the attempted target is still alive, phase holds.
+    assert.strictEqual(room.state.phase, GamePhase.GAME_OVER);
+    assert.strictEqual(room.state.players.get(guests[5].sessionId)!.isAlive, true);
+    assert.strictEqual(room.state.players.get(guests[4].sessionId)!.isAlive, true);
+  });
+
+  it("a client whose onJoin fires after GAME_OVER is replayed the reveal", async () => {
+    const setup = await setupRoom(colyseus, 10);
+    const { room, guests } = setup;
+
+    // Quickest route to GAME_OVER: both blacks declared dead during Night 1.
+    await dropAndDeclare(setup, 0);
+    await dropAndDeclare(setup, 1);
+    await new Promise((r) => setTimeout(r, 50));
+    assert.strictEqual(room.state.phase, GamePhase.GAME_OVER);
+
+    // guests[2] (alive red) reconnects after the game ended: re-enter onJoin
+    // for their server-side client — the same path the Colyseus reconnection
+    // grace takes. auth.onJoin preserves the existing Player; the room
+    // replays the game-over reveal.
+    const replayed: unknown[] = [];
+    guests[2].onMessage("gameOver", (p: unknown) => replayed.push(p));
+    const serverClient = (room as unknown as {
+      clients: Parameters<MafiaRoom["onJoin"]>[0][];
+    }).clients.find((c) => c.sessionId === guests[2].sessionId);
+    assert.ok(serverClient, "guest's server-side client found");
+    room.onJoin(serverClient);
+    await new Promise((r) => setTimeout(r, 50));
+
+    assert.strictEqual(replayed.length, 1, "the reconnecting client receives the reveal");
+    const payload = replayed[0] as { winner: string; reason: string; reveal: unknown[] };
+    assert.strictEqual(payload.winner, "RED");
+    assert.strictEqual(payload.reason, "CIVILIAN_VICTORY");
+    assert.strictEqual(payload.reveal.length, 10);
+    // The rejoin clobbered nothing.
+    assert.strictEqual(room.state.players.get(guests[2].sessionId)!.isAlive, true);
+    assert.strictEqual(room.state.phase, GamePhase.GAME_OVER);
   });
   });
 });

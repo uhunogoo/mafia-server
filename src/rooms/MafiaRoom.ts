@@ -7,6 +7,7 @@ import {
   DonCheckResult,
   EngineError,
   EngineErrorCode,
+  GameOverResult,
   PingRecord,
   SheriffCheckResult,
   TieArbitrationChoice,
@@ -343,12 +344,18 @@ export class MafiaRoom extends Room {
       this.state.revoteBehavior = options.revoteBehavior;
     }
 
-    // Subscribe to the engine's death seam (ticket 03). Today the seam is a
-    // no-op; a follow-up ticket (09) wires it to the victory check so the
-    // engine can transition to GAME_OVER when one side is wiped out.
+    // Subscribe to the engine's death seam (ticket 03). The victory check
+    // runs inside the engine's death funnel (ticket 09); the room only
+    // observes deaths here for host notifications.
     this.engine.setOnPlayerDied((_sessionId, _cause) => {
-      // Intentionally empty for this ticket.
+      // Intentionally empty — host-side death notifications go through the
+      // dedicated per-cause messages (playerDeclaredDead, etc.).
     });
+
+    // Ticket 09: when the engine ends the game, broadcast the final role
+    // reveal to every connected client (host included) as a private
+    // `gameOver` message — the public schema never carries roles (ADR 0004).
+    this.engine.setOnGameOver((result) => this.broadcastGameOver(result));
 
     // Start the phase-timer driver (ticket 04). Calls engine.tickPhaseTimer()
     // on every interval; reminders are forwarded to the host. The handle is
@@ -377,6 +384,15 @@ export class MafiaRoom extends Room {
     this.auth.onJoin(client);
     if (this.engine.clearMissing(client.sessionId)) {
       this.notifyHostOfPlayerReturned(client.sessionId);
+    }
+
+    // Ticket 09: a client whose onJoin fires after the game ended — e.g. a
+    // player reconnecting from a drop that outlived the winning death — must
+    // still learn the outcome. Replay the same private payload the live
+    // broadcast delivered.
+    const result = this.engine.getGameOverResult();
+    if (result) {
+      client.send("gameOver", this.gameOverPayload(result));
     }
   }
 
@@ -513,6 +529,28 @@ export class MafiaRoom extends Room {
     const host = this.findHostClient();
     if (!host) return;
     host.send("playerDeclaredDead", { sessionId });
+  }
+
+  /**
+   * Ticket 09: the private `gameOver` payload — winning team, reason, and
+   * every player's role + team (from the engine's identity map; the host has
+   * no role and is not included). The reveal travels as a private message
+   * per client: the public schema never carries roles, even after the game
+   * ends (ADR 0004).
+   */
+  private gameOverPayload(result: GameOverResult) {
+    return {
+      winner: result.winner,
+      reason: result.reason,
+      reveal: this.engine.getRoleReveal(),
+    };
+  }
+
+  private broadcastGameOver(result: GameOverResult): void {
+    const payload = this.gameOverPayload(result);
+    for (const c of this.clients) {
+      c.send("gameOver", payload);
+    }
   }
 
   /**
