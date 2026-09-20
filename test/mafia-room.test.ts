@@ -34,8 +34,9 @@ interface Setup {
 async function setupRoom(
   colyseus: ColyseusTestServer<typeof appConfig>,
   playerCount: number,
+  createOptions: { revoteCap?: number; revoteBehavior?: string } = {},
 ): Promise<Setup> {
-  const room = (await colyseus.createRoom("mafia_room", {})) as MafiaRoom;
+  const room = (await colyseus.createRoom("mafia_room", createOptions)) as MafiaRoom;
 
   const host = (await colyseus.connectTo(room, {
     name: "Host",
@@ -380,16 +381,14 @@ describe("mafia_room", () => {
   // в”Ђв”Ђв”Ђ Ticket 03: Day-1 basic flow в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 
   /**
-   * Drive the room through a full Day 1 cycle, starting from the post-
-   * startGame NIGHT state produced by `setupRoom`. Mirrors the engine
-   * helper but goes through the room's message layer. Nominations are
-   * submitted AFTER `startSpeeches` (the only phase in which they're valid);
-   * votes are submitted AFTER DAY_VOTING is reached.
+   * Drive the room from the post-startGame NIGHT state to DAY_VOTING:
+   * night actions (mafia kill saved by the doctor), speeches with
+   * nominations, and the defense round. Returns with the phase at
+   * DAY_VOTING, ready for votes (ticket 08: possibly across revote rounds).
    */
-  async function driveDay1(
+  async function driveToVoting(
     setup: Setup,
     nominations: { nominator: SDKRoom<MafiaRoom, MafiaState>; target: string }[],
-    votes: { voter: SDKRoom<MafiaRoom, MafiaState>; target: string }[],
   ): Promise<void> {
     const { room, host, guests } = setup;
 
@@ -434,14 +433,41 @@ describe("mafia_room", () => {
       await room.waitForNextPatch();
     }
     assert.strictEqual(room.state.phase, GamePhase.DAY_VOTING);
+  }
 
-    // Cast explicit votes.
+  /**
+   * Cast one voting round through the message layer and resolve it. Used
+   * for revote rounds (ticket 08) — the initial round is part of
+   * `driveDay1`.
+   */
+  async function voteRound(
+    setup: Setup,
+    votes: { voter: SDKRoom<MafiaRoom, MafiaState>; target: string }[],
+  ): Promise<void> {
     for (const v of votes) {
       v.voter.send("vote", { targetId: v.target });
-      await room.waitForNextPatch();
+      await setup.room.waitForNextPatch();
     }
-    host.send("resolveVoting");
-    await room.waitForNextPatch();
+    setup.host.send("resolveVoting");
+    await setup.room.waitForNextPatch();
+  }
+
+  /**
+   * Drive the room through a full Day 1 cycle, starting from the post-
+   * startGame NIGHT state produced by `setupRoom`. Mirrors the engine
+   * helper but goes through the room's message layer. Nominations are
+   * submitted AFTER `startSpeeches` (the only phase in which they're valid);
+   * votes are submitted AFTER DAY_VOTING is reached.
+   */
+  async function driveDay1(
+    setup: Setup,
+    nominations: { nominator: SDKRoom<MafiaRoom, MafiaState>; target: string }[],
+    votes: { voter: SDKRoom<MafiaRoom, MafiaState>; target: string }[],
+  ): Promise<void> {
+    await driveToVoting(setup, nominations);
+
+    // Cast explicit votes.
+    await voteRound(setup, votes);
   }
 
   it("a full Day 1 cycle ends with the correct player eliminated and the engine in NIGHT phase", async () => {
@@ -586,6 +612,284 @@ describe("mafia_room", () => {
     await setup.room.waitForNextPatch();
 
     assert.ok(errors.length > 0, "vote for a non-nominated player must error");
+  });
+
+  // в”Ђв”Ђв”Ђ Ticket 08: voting edge cases + room-creation settings в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+
+  /**
+   * Drive a revoteCap=1 room into the pending host-decision state (ticket
+   * 08): two consecutive 3-way ties, the second hitting the cap. Returns
+   * the setup, the tied leaders' sessionIds ([p6, p7, p8]), and the
+   * `revoteCapReached` prompts received by the host.
+   */
+  async function driveToPendingTieDecision(): Promise<{
+    setup: Setup;
+    tied: string[];
+    prompts: { tiedLeaders: string[]; revoteCap: number }[];
+  }> {
+    const setup = await setupRoom(colyseus, 10, { revoteCap: 1 });
+    const p6 = setup.guests[6].sessionId;
+    const p7 = setup.guests[7].sessionId;
+    const p8 = setup.guests[8].sessionId;
+
+    const prompts: { tiedLeaders: string[]; revoteCap: number }[] = [];
+    setup.host.onMessage("revoteCapReached", (msg: unknown) => {
+      prompts.push(msg as { tiedLeaders: string[]; revoteCap: number });
+    });
+
+    const tieVotes = [
+      ...setup.guests.slice(0, 3).map((v) => ({ voter: v, target: p6 })),
+      ...setup.guests.slice(3, 6).map((v) => ({ voter: v, target: p7 })),
+      ...setup.guests.slice(6, 9).map((v) => ({ voter: v, target: p8 })),
+    ];
+
+    await driveDay1(
+      setup,
+      [
+        { nominator: setup.guests[0], target: p6 },
+        { nominator: setup.guests[1], target: p7 },
+        { nominator: setup.guests[2], target: p8 },
+      ],
+      tieVotes,
+    );
+    assert.strictEqual(setup.room.state.phase, GamePhase.DAY_VOTING, "revote 1 held");
+
+    // Second 3-way tie — the cap (1) is exhausted → the host is prompted.
+    await voteRound(setup, tieVotes);
+    assert.strictEqual(setup.room.state.phase, GamePhase.DAY_VOTING);
+    assert.ok(setup.room.engine.getPendingTieDecision());
+
+    return { setup, tied: [p6, p7, p8], prompts };
+  }
+
+  it("room-creation defaults: revoteCap 3, revoteBehavior host-arbitrates", async () => {
+    const { room } = await setupRoom(colyseus, 10);
+    assert.strictEqual(room.state.revoteCap, 3);
+    assert.strictEqual(room.state.revoteBehavior, "host-arbitrates");
+  });
+
+  it("room creation accepts revoteCap and revoteBehavior", async () => {
+    const room = (await colyseus.createRoom("mafia_room", {
+      revoteCap: 5,
+      revoteBehavior: "auto-pardon",
+    })) as MafiaRoom;
+    assert.strictEqual(room.state.revoteCap, 5);
+    assert.strictEqual(room.state.revoteBehavior, "auto-pardon");
+  });
+
+  it("room creation rejects an invalid revoteCap", async () => {
+    await assert.rejects(() => colyseus.createRoom("mafia_room", { revoteCap: 0 }));
+  });
+
+  it("room creation rejects an invalid revoteBehavior", async () => {
+    await assert.rejects(() =>
+      colyseus.createRoom("mafia_room", { revoteBehavior: "coin-flip" }),
+    );
+  });
+
+  it("a duplicate vote from the same player is rejected", async () => {
+    const setup = await setupRoom(colyseus, 10);
+    await driveToVoting(setup, [
+      { nominator: setup.guests[0], target: setup.guests[6].sessionId },
+    ]);
+
+    const errors: string[] = [];
+    setup.guests[0].onMessage("error", (msg: unknown) => {
+      errors.push(String((msg as { message?: string }).message ?? msg));
+    });
+
+    setup.guests[0].send("vote", { targetId: setup.guests[6].sessionId });
+    await setup.room.waitForNextPatch();
+    assert.strictEqual(errors.length, 0, "first vote accepted");
+
+    setup.guests[0].send("vote", { targetId: setup.guests[6].sessionId });
+    await setup.room.waitForNextPatch();
+    assert.strictEqual(errors.length, 1, "duplicate vote rejected");
+    assert.strictEqual(
+      setup.room.engine.getVote(setup.guests[0].sessionId),
+      setup.guests[6].sessionId,
+      "original vote stands",
+    );
+  });
+
+  it("a 2-way tie auto-pardons: nobody is eliminated and night falls", async () => {
+    const setup = await setupRoom(colyseus, 10);
+    const p6 = setup.guests[6].sessionId;
+    const p7 = setup.guests[7].sessionId;
+
+    await driveDay1(
+      setup,
+      [
+        { nominator: setup.guests[0], target: p6 },
+        { nominator: setup.guests[1], target: p7 },
+      ],
+      [
+        ...setup.guests.slice(0, 5).map((v) => ({ voter: v, target: p6 })),
+        ...setup.guests.slice(5, 10).map((v) => ({ voter: v, target: p7 })),
+      ],
+    );
+
+    assert.strictEqual(setup.room.state.phase, GamePhase.NIGHT);
+    assert.strictEqual(setup.room.state.players.get(p6)!.isAlive, true);
+    assert.strictEqual(setup.room.state.players.get(p7)!.isAlive, true);
+    assert.strictEqual(setup.room.engine.getPendingTieDecision(), null);
+  });
+
+  it("a 3-way tie starts a revote among the tied leaders; the next round eliminates", async () => {
+    const setup = await setupRoom(colyseus, 10);
+    const p6 = setup.guests[6].sessionId;
+    const p7 = setup.guests[7].sessionId;
+    const p8 = setup.guests[8].sessionId;
+
+    // guests[9] stays silent — their default vote goes to the off-ballot
+    // last speaker and lands nowhere, leaving a 3-way tie.
+    await driveDay1(
+      setup,
+      [
+        { nominator: setup.guests[0], target: p6 },
+        { nominator: setup.guests[1], target: p7 },
+        { nominator: setup.guests[2], target: p8 },
+      ],
+      [
+        ...setup.guests.slice(0, 3).map((v) => ({ voter: v, target: p6 })),
+        ...setup.guests.slice(3, 6).map((v) => ({ voter: v, target: p7 })),
+        ...setup.guests.slice(6, 9).map((v) => ({ voter: v, target: p8 })),
+      ],
+    );
+
+    assert.strictEqual(setup.room.state.phase, GamePhase.DAY_VOTING, "revote round started");
+    assert.strictEqual(setup.room.engine.getRevoteCount(), 1);
+    assert.deepStrictEqual([...setup.room.state.nominations], [p6, p7, p8]);
+    assert.strictEqual(setup.room.engine.getPendingTieDecision(), null);
+
+    // Revote round: 5/3/2 → p6 is the single winner.
+    await voteRound(
+      setup,
+      [
+        ...setup.guests.slice(0, 5).map((v) => ({ voter: v, target: p6 })),
+        ...setup.guests.slice(5, 8).map((v) => ({ voter: v, target: p7 })),
+        ...setup.guests.slice(8, 10).map((v) => ({ voter: v, target: p8 })),
+      ],
+    );
+
+    assert.strictEqual(setup.room.state.phase, GamePhase.NIGHT);
+    assert.strictEqual(setup.room.state.players.get(p6)!.isAlive, false);
+    assert.strictEqual(setup.room.state.players.get(p7)!.isAlive, true);
+    assert.strictEqual(setup.room.state.players.get(p8)!.isAlive, true);
+  });
+
+  it("revoteCap reached → the host is prompted; force-candidate arbitration ends the day", async () => {
+    const { setup, tied, prompts } = await driveToPendingTieDecision();
+    const [p6, p7, p8] = tied;
+
+    assert.strictEqual(prompts.length, 1);
+    assert.deepStrictEqual(prompts[0].tiedLeaders, [p6, p7, p8]);
+    assert.strictEqual(prompts[0].revoteCap, 1);
+    assert.strictEqual(setup.room.state.phase, GamePhase.DAY_VOTING);
+
+    setup.host.send("arbitrateTie", { choice: "force-candidate", targetId: p7 });
+    await setup.room.waitForNextPatch();
+
+    assert.strictEqual(setup.room.state.phase, GamePhase.NIGHT);
+    assert.strictEqual(setup.room.state.players.get(p7)!.isAlive, false);
+    assert.strictEqual(setup.room.state.players.get(p6)!.isAlive, true);
+    assert.strictEqual(setup.room.state.players.get(p8)!.isAlive, true);
+    assert.strictEqual(setup.room.engine.getPendingTieDecision(), null);
+  });
+
+  it("arbitrateTie auto-pardon ends the day with nobody eliminated", async () => {
+    const { setup } = await driveToPendingTieDecision();
+
+    setup.host.send("arbitrateTie", { choice: "auto-pardon" });
+    await setup.room.waitForNextPatch();
+
+    assert.strictEqual(setup.room.state.phase, GamePhase.NIGHT);
+    for (const g of setup.guests) {
+      assert.strictEqual(setup.room.state.players.get(g.sessionId)!.isAlive, true);
+    }
+    assert.strictEqual(setup.room.engine.getPendingTieDecision(), null);
+  });
+
+  it("arbitrateTie kick-player ejects a non-tied player and restarts the revote", async () => {
+    const { setup, tied } = await driveToPendingTieDecision();
+    const [p6, p7, p8] = tied;
+    const kicked = setup.guests[2].sessionId;
+
+    setup.host.send("arbitrateTie", {
+      choice: "kick-player",
+      targetId: kicked,
+      reason: "stalling the vote",
+    });
+    await setup.room.waitForNextPatch();
+
+    assert.strictEqual(setup.room.state.players.get(kicked)!.isAlive, false);
+    assert.strictEqual(setup.room.state.phase, GamePhase.DAY_VOTING, "revote restarts after the kick");
+    assert.strictEqual(setup.room.engine.getPendingTieDecision(), null);
+
+    // 9 voters remain: 4/3/2 → p6 is the single winner.
+    await voteRound(setup, [
+      { voter: setup.guests[0], target: p6 },
+      { voter: setup.guests[1], target: p6 },
+      { voter: setup.guests[3], target: p6 },
+      { voter: setup.guests[4], target: p6 },
+      { voter: setup.guests[5], target: p7 },
+      { voter: setup.guests[6], target: p7 },
+      { voter: setup.guests[9], target: p7 },
+      { voter: setup.guests[7], target: p8 },
+      { voter: setup.guests[8], target: p8 },
+    ]);
+
+    assert.strictEqual(setup.room.state.phase, GamePhase.NIGHT);
+    assert.strictEqual(setup.room.state.players.get(p6)!.isAlive, false);
+  });
+
+  it("a non-host cannot arbitrate a tie", async () => {
+    const { setup } = await driveToPendingTieDecision();
+
+    const errors: string[] = [];
+    setup.guests[0].onMessage("error", (msg: unknown) => {
+      errors.push(String((msg as { message?: string }).message ?? msg));
+    });
+
+    setup.guests[0].send("arbitrateTie", { choice: "auto-pardon" });
+    await setup.room.waitForNextPatch();
+
+    assert.ok(errors.length > 0, "non-host arbitration must error");
+    assert.strictEqual(setup.room.state.phase, GamePhase.DAY_VOTING);
+    assert.ok(setup.room.engine.getPendingTieDecision(), "decision still pending");
+  });
+
+  it("revoteBehavior auto-pardon short-circuits a 3-way tie with no host step", async () => {
+    const setup = await setupRoom(colyseus, 10, { revoteBehavior: "auto-pardon" });
+    const p6 = setup.guests[6].sessionId;
+    const p7 = setup.guests[7].sessionId;
+    const p8 = setup.guests[8].sessionId;
+
+    const prompts: unknown[] = [];
+    setup.host.onMessage("revoteCapReached", (msg: unknown) => {
+      prompts.push(msg);
+    });
+
+    await driveDay1(
+      setup,
+      [
+        { nominator: setup.guests[0], target: p6 },
+        { nominator: setup.guests[1], target: p7 },
+        { nominator: setup.guests[2], target: p8 },
+      ],
+      [
+        ...setup.guests.slice(0, 3).map((v) => ({ voter: v, target: p6 })),
+        ...setup.guests.slice(3, 6).map((v) => ({ voter: v, target: p7 })),
+        ...setup.guests.slice(6, 9).map((v) => ({ voter: v, target: p8 })),
+      ],
+    );
+
+    assert.strictEqual(setup.room.state.phase, GamePhase.NIGHT);
+    assert.strictEqual(prompts.length, 0, "no host prompt");
+    assert.strictEqual(setup.room.engine.getRevoteCount(), 0);
+    for (const g of setup.guests) {
+      assert.strictEqual(setup.room.state.players.get(g.sessionId)!.isAlive, true);
+    }
   });
 
   // в”Ђв”Ђв”Ђ Ticket 04: phase timers + host overrides в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ

@@ -15,6 +15,7 @@ import {
   ROLE_DISTRIBUTION,
   SheriffCheckResult,
   SUPPORTED_PLAYER_COUNTS,
+  VoteOutcome,
   VoteResolution,
 } from "./types.js";
 
@@ -106,6 +107,23 @@ function shuffle<T>(items: readonly T[]): T[] {
  *    Day N+1 is the seat immediately after Day N's first speaker; this is
  *    driven by tracking the previous day's first speaker sessionId and
  *    rotating the speaking order to start from the next clockwise seat
+ *
+ * Slice-8 (ticket 08) rewrites the voting resolution into the ADR 0003/0006
+ * behavior, replacing ticket 03's deterministic first-nomination tie-break:
+ *  - votes are immutable once cast — a second `vote` from the same actor in
+ *    the same round is rejected (rules.md: simultaneous voting); the buffer
+ *    clears when a revote round starts so players vote again
+ *  - a 2-way tie auto-pardons: nobody dies, the day ends, night falls
+ *  - a 3+ way tie starts a revote among the tied leaders — the public ballot
+ *    (`state.nominations`) narrows to the tied set — for up to
+ *    `state.revoteCap` consecutive 3+-way revotes
+ *  - after the cap the engine pauses in DAY_VOTING with a pending host
+ *    decision; the host arbitrates via `resolveTieByPardon`,
+ *    `resolveTieByForce`, or `resolveTieByKick` (the kick choice routes
+ *    through ticket 06's `kick` and restarts the revote with one fewer voter)
+ *  - `state.revoteBehavior = "auto-pardon"` short-circuits any tie to an
+ *    immediate pardon with no host step
+ *  - room creation accepts `revoteCap` / `revoteBehavior` (wired in MafiaRoom)
  *
  * The engine never touches the network; the room translates `EngineError`
  * into player-visible messages and `client.send` for private role reveals.
@@ -218,6 +236,23 @@ export class Engine {
    */
   private missing = new Set<string>();
 
+  /**
+   * Number of revote rounds held during the current day that each originated
+   * from a 3+ way tie (ADR 0006). Compared against `state.revoteCap` to
+   * decide when the host must arbitrate; reset with the rest of the day
+   * state when a new day starts. A value > 0 also marks that the current
+   * DAY_VOTING is a revote round whose ballot is exactly the tied leaders.
+   */
+  private revoteCount = 0;
+
+  /**
+   * Non-null while a 3+ way tie has exhausted `revoteCap` consecutive
+   * revotes and the engine is paused in DAY_VOTING awaiting the host's
+   * arbitration (ADR 0006). Carries the tied leaders the host decides
+   * between. Cleared when the day ends or the host resolves the decision.
+   */
+  private pendingTieDecision: { tiedLeaders: string[] } | null = null;
+
   private nextEntryId = 0;
 
   /**
@@ -317,6 +352,25 @@ export class Engine {
    */
   getVote(voterSessionId: string): string {
     return this.votes.get(voterSessionId) ?? "";
+  }
+
+  /**
+   * Ticket 08: the pending host-arbitration decision, or `null` when voting
+   * is not paused. `tiedLeaders` are the candidates the host decides between
+   * (ADR 0006). The room pushes a `revoteCapReached` message to the host when
+   * this becomes non-null; this accessor lets the host UI (and tests) re-read
+   * the decision state without replaying the log.
+   */
+  getPendingTieDecision(): { tiedLeaders: string[] } | null {
+    return this.pendingTieDecision ? { tiedLeaders: [...this.pendingTieDecision.tiedLeaders] } : null;
+  }
+
+  /**
+   * Ticket 08: how many 3+ way tie revotes have been held during the current
+   * day (ADR 0006). Resets when the next day starts.
+   */
+  getRevoteCount(): number {
+    return this.revoteCount;
   }
 
   /**
@@ -761,12 +815,27 @@ export class Engine {
 
   /**
    * Record `actorSessionId`'s vote for `targetId`. Valid only during
-   * DAY_VOTING; the target must already be nominated. Players can re-vote
-   * before the round closes; only the latest choice counts.
+   * DAY_VOTING; the target must already be nominated. Votes are immutable
+   * once cast (rules.md: simultaneous voting) — a second vote from the same
+   * actor in the same round is rejected; re-voting is explicitly out of
+   * scope (ticket 08). A revote round clears the buffer, so everyone votes
+   * afresh among the tied leaders.
    */
   vote(actorSessionId: string, targetId: string): void {
     this.requirePhase(GamePhase.DAY_VOTING);
     this.requireAlivePlayer(actorSessionId);
+    if (this.pendingTieDecision) {
+      throw new EngineError(
+        EngineErrorCode.WRONG_PHASE,
+        "Voting is paused — the host must arbitrate the tied vote first",
+      );
+    }
+    if (this.votes.has(actorSessionId)) {
+      throw new EngineError(
+        EngineErrorCode.VOTE_ALREADY_CAST,
+        `Player ${actorSessionId} has already voted in this round`,
+      );
+    }
     this.requireAlivePlayer(targetId);
     if (!this.state.nominations.includes(targetId)) {
       throw new EngineError(
@@ -784,24 +853,46 @@ export class Engine {
   }
 
   /**
-   * Tally the day's votes and eliminate the highest-voted candidate (single-
-   * winner rule for Day 1; tie-breaking follows first-nominated-wins). Any
-   * alive player who did not submit a vote gets a default vote cast for the
-   * last speaker (per ADR 0003). Marks the loser dead, writes per-candidate
-   * totals to `Player.votes`, fires the `onPlayerDied` seam, and transitions
-   * DAY_VOTING → NIGHT.
+   * Tally the current round's votes and resolve it (ticket 08, ADR 0003 +
+   * ADR 0006). Any alive player who did not submit a vote gets a default
+   * vote cast for the last speaker (per ADR 0003); in a revote round the
+   * default only lands when the last speaker is one of the tied leaders —
+   * otherwise it counts toward nobody, and a persistent deadlock falls to
+   * the host via the revote cap.
    *
-   * The candidate list for tally purposes is the explicit nominations plus
-   * the last speaker — the last speaker implicitly receives default votes
-   * from non-voters and is therefore eligible to win even if they did not
-   * formally nominate themselves.
+   * Outcomes:
+   * - Single winner → the winner is eliminated (`Player.votes` tallies are
+   *   written, the `onPlayerDied` seam fires with VOTE_ELIMINATION) and the
+   *   day ends: DAY_VOTING → NIGHT.
+   * - Exactly 2 tied leaders → auto-pardon (ADR 0003): nobody dies, the day
+   *   ends, night falls.
+   * - 3+ tied leaders under `revoteBehavior = "auto-pardon"` → auto-pardon
+   *   immediately, no host step (ADR 0006).
+   * - 3+ tied leaders under "host-arbitrates" before the cap → a revote
+   *   round among the tied leaders starts: the public ballot
+   *   (`state.nominations`) narrows to the tied set, the vote buffer clears,
+   *   and the phase stays DAY_VOTING so players vote again.
+   * - 3+ tied leaders after `revoteCap` consecutive such revotes → the
+   *   engine pauses in DAY_VOTING with a pending host decision; the host
+   *   resolves it via `resolveTieByPardon` / `resolveTieByForce` /
+   *   `resolveTieByKick`.
+   * - No nominations → no elimination, night falls (the last speaker is on
+   *   the candidate list only so default votes land, they cannot "win").
    *
-   * Returns the resolution for tests and action-log payloads. If no one was
-   * nominated and there is no last speaker (e.g., all players dead), no one
-   * is eliminated and the callback is not fired.
+   * The candidate list for the initial round is the explicit nominations
+   * plus the last speaker; for a revote round it is exactly the tied leaders
+   * (already written to `state.nominations` by `startRevote`).
+   *
+   * Returns the resolution for tests and action-log payloads.
    */
   resolveVoting(): VoteResolution {
     this.requirePhase(GamePhase.DAY_VOTING);
+    if (this.pendingTieDecision) {
+      throw new EngineError(
+        EngineErrorCode.WRONG_PHASE,
+        "A tie decision is pending — the host must arbitrate first",
+      );
+    }
 
     // Build a complete roster of voters: every alive non-host player gets a
     // vote recorded. Non-voters are auto-assigned to the last speaker.
@@ -819,57 +910,67 @@ export class Engine {
       effective.set(voter, explicit ?? lastSpeaker);
     }
 
-    // The candidate list is the explicit nominations plus the last speaker
-    // (who implicitly receives default votes from non-voters).
+    // The ballot: nominations plus (initial round only) the implicit last
+    // speaker. In a revote round `state.nominations` is already the tied set.
+    const isRevoteRound = this.revoteCount > 0;
     const candidates: string[] = [...this.state.nominations];
-    if (lastSpeaker !== "" && !candidates.includes(lastSpeaker)) {
+    if (!isRevoteRound && lastSpeaker !== "" && !candidates.includes(lastSpeaker)) {
       candidates.push(lastSpeaker);
     }
 
-    // Tally per candidate.
+    // Tally per candidate. Votes for non-candidates (a default vote for a
+    // last speaker who is off the revote ballot) land on nobody.
     const counts: Record<string, number> = {};
     for (const candidate of candidates) {
       counts[candidate] = 0;
     }
     for (const target of effective.values()) {
-      if (target === "") continue;
+      if (target === "" || !(target in counts)) continue;
       counts[target] = (counts[target] ?? 0) + 1;
     }
 
-    // Pick the single highest-voted candidate. Deterministic tie-break:
-    // first candidate in candidate-list order (i.e. nomination order, with
-    // the implicit last speaker appended last). 3-way revote logic lives in
-    // the follow-up ticket 08.
-    //
-    // If no one was explicitly nominated, no one is eliminated — the last
-    // speaker is added to the candidate list only so default votes have a
-    // landing target, but they do not "win" when they were never on the
-    // actual ballot.
-    let eliminatedId = "";
     let best = -1;
-    if (this.state.nominations.length > 0) {
-      for (const candidate of candidates) {
-        const c = counts[candidate] ?? 0;
-        if (c > best) {
-          best = c;
-          eliminatedId = candidate;
-        }
-      }
+    for (const candidate of candidates) {
+      const c = counts[candidate] ?? 0;
+      if (c > best) best = c;
+    }
+    const leaders = candidates.filter((c) => (counts[c] ?? 0) === best);
+
+    // Decide the outcome (ticket 08 — see the docstring above).
+    let outcome: VoteOutcome;
+    let eliminatedId = "";
+    let tiedLeaders: string[] = [];
+    if (leaders.length === 0 || (!isRevoteRound && this.state.nominations.length === 0)) {
+      outcome = "no-candidates";
+    } else if (leaders.length === 1) {
+      outcome = "eliminated";
+      eliminatedId = leaders[0]!;
+    } else if (leaders.length === 2 || this.state.revoteBehavior === "auto-pardon") {
+      outcome = "auto-pardon";
+      tiedLeaders = leaders;
+    } else if (this.revoteCount >= this.state.revoteCap) {
+      outcome = "host-decision";
+      tiedLeaders = leaders;
+    } else {
+      outcome = "revote";
+      tiedLeaders = leaders;
     }
 
     // Write per-candidate totals to the public schema. The tallies persist
     // on Player.votes until the next DAY_ANNOUNCEMENT (cleared in
-    // resetDayState), so clients can read the day's final results during
-    // the post-resolution NIGHT.
+    // resetDayState), so clients can read the round's results afterward.
     for (const candidate of candidates) {
       const player = this.state.players.get(candidate);
       if (player) player.votes = counts[candidate] ?? 0;
     }
 
     const resolution: VoteResolution = {
+      outcome,
       eliminatedId,
       voteCounts: counts,
       totalVotes: voters.length,
+      tiedLeaders: tiedLeaders.length > 0 ? [...tiedLeaders] : undefined,
+      revoteNumber: outcome === "revote" ? this.revoteCount + 1 : undefined,
     };
 
     this.logEntry({
@@ -878,26 +979,182 @@ export class Engine {
       payload: { event: "voting_resolved", ...resolution },
     });
 
-    // Mark the loser dead and fire the seam. The seam is intentionally the
-    // only place that knows about the death — the room uses it to run victory
-    // checks and host notifications.
+    switch (outcome) {
+      case "no-candidates":
+      case "auto-pardon":
+        this.endDay("");
+        break;
+      case "eliminated":
+        this.endDay(eliminatedId);
+        break;
+      case "revote":
+        this.startRevote(tiedLeaders);
+        break;
+      case "host-decision":
+        this.pendingTieDecision = { tiedLeaders: [...tiedLeaders] };
+        this.logEntry({
+          actorSessionId: "",
+          type: ActionType.PHASE_ADVANCE,
+          payload: {
+            event: "revote_cap_reached",
+            revoteCap: this.state.revoteCap,
+            tiedLeaders: [...tiedLeaders],
+          },
+        });
+        break;
+    }
+
+    return resolution;
+  }
+
+  // ─── Voting ties: revote loop + host arbitration (ticket 08) ────────────
+
+  /**
+   * Start a revote round among `leaders`. Increments the consecutive 3+ way
+   * revote counter, narrows the public ballot to the tied leaders (so
+   * `vote` target validation and the client UI follow automatically), and
+   * clears the vote buffer — votes are immutable within a round, and a
+   * revote is a new round. The phase stays DAY_VOTING; the host drives the
+   * next `resolveVoting` call. Returns the 1-based round number.
+   */
+  private startRevote(leaders: string[]): number {
+    this.revoteCount += 1;
+
+    this.state.nominations.splice(0, this.state.nominations.length);
+    for (const id of leaders) {
+      this.state.nominations.push(id);
+    }
+    for (const p of this.state.players.values()) {
+      p.isNominated = leaders.includes(p.sessionId);
+    }
+
+    this.votes.clear();
+
+    this.logEntry({
+      actorSessionId: "",
+      type: ActionType.PHASE_ADVANCE,
+      payload: {
+        event: "revote_started",
+        revoteNumber: this.revoteCount,
+        tiedLeaders: [...leaders],
+      },
+    });
+    return this.revoteCount;
+  }
+
+  /**
+   * End the day after a vote resolution: mark `eliminatedId` dead (empty
+   * string = auto-pardon), fire the `onPlayerDied` seam, clear transient
+   * day-cycle state (preserving Player.votes so the final tally stays
+   * visible), and transition DAY_VOTING → NIGHT with a fresh mafia window.
+   */
+  private endDay(eliminatedId: string): void {
     if (eliminatedId !== "") {
       const target = this.state.players.get(eliminatedId);
       if (target) target.isAlive = false;
       this.onPlayerDied?.(eliminatedId, "VOTE_ELIMINATION");
     }
 
-    // Clear transient day-cycle engine state, but preserve Player.votes (see
-    // comment above) so the final tally is visible during the post-vote NIGHT.
-    // Votes are cleared on the next DAY_ANNOUNCEMENT via resetDayState.
     this.resetDayState({ preserveTallies: true });
 
     this.state.phase = GamePhase.NIGHT;
     this.state.nightStep = NightStep.MAFIA;
     // Night begins with a fresh 60s mafia window.
     this.startTimer("MAFIA_WINDOW");
+  }
 
-    return resolution;
+  /**
+   * The host's arbitration entry point when the revote cap is reached. All
+   * three choices require the engine to actually be paused on a pending tie
+   * decision; `resolveTieByKick` additionally routes through ticket 06's
+   * `kick` (same validation, log entry, and death seam).
+   */
+  private requirePendingTieDecision(): { tiedLeaders: string[] } {
+    if (!this.pendingTieDecision) {
+      throw new EngineError(
+        EngineErrorCode.WRONG_PHASE,
+        "No tie decision is pending — the voting phase is not paused for arbitration",
+      );
+    }
+    return this.pendingTieDecision;
+  }
+
+  /**
+   * Host arbitration (ADR 0006), choice "auto-pardon": nobody is eliminated,
+   * the day ends, night falls.
+   */
+  resolveTieByPardon(hostSessionId: string): void {
+    this.requireHost(hostSessionId);
+    const pending = this.requirePendingTieDecision();
+
+    this.logEntry({
+      actorSessionId: hostSessionId,
+      type: ActionType.TIE_ARBITRATION,
+      payload: { choice: "auto-pardon", tiedLeaders: [...pending.tiedLeaders] },
+    });
+
+    this.endDay("");
+  }
+
+  /**
+   * Host arbitration (ADR 0006), choice "force a candidate": the host picks
+   * one of the tied leaders; the day ends with that candidate eliminated
+   * through the normal vote-elimination path (same death cause and seam as
+   * a vote winner, so the victory check treats it uniformly).
+   */
+  resolveTieByForce(hostSessionId: string, targetId: string): void {
+    this.requireHost(hostSessionId);
+    const pending = this.requirePendingTieDecision();
+    if (!pending.tiedLeaders.includes(targetId)) {
+      throw new EngineError(
+        EngineErrorCode.WRONG_ROLE,
+        `Player ${targetId} is not one of the tied leaders`,
+      );
+    }
+
+    this.logEntry({
+      actorSessionId: hostSessionId,
+      type: ActionType.TIE_ARBITRATION,
+      payload: { choice: "force-candidate", targetId, tiedLeaders: [...pending.tiedLeaders] },
+    });
+
+    this.endDay(targetId);
+  }
+
+  /**
+   * Host arbitration (ADR 0006), choice "kick a player": the host removes a
+   * NON-tied player (e.g. suspected of stalling the vote) — the kick routes
+   * through ticket 06's `kick` path, and the tied leaders revote again with
+   * one fewer voter. Kicking a tied leader is rejected (that is what
+   * "force a candidate" is for). The revote counter is not reset: the ties
+   * stay consecutive, so another 3+ way tie after the kick returns straight
+   * to the host.
+   */
+  resolveTieByKick(hostSessionId: string, targetId: string, reason: string): void {
+    this.requireHost(hostSessionId);
+    const pending = this.requirePendingTieDecision();
+    if (pending.tiedLeaders.includes(targetId)) {
+      throw new EngineError(
+        EngineErrorCode.WRONG_ROLE,
+        "Cannot break a tie by kicking a tied leader — use force-candidate instead",
+      );
+    }
+
+    this.logEntry({
+      actorSessionId: hostSessionId,
+      type: ActionType.TIE_ARBITRATION,
+      payload: { choice: "kick-player", targetId, reason, tiedLeaders: [...pending.tiedLeaders] },
+    });
+
+    // Ticket 06's path: validation, KICK log entry, KICKED death seam.
+    this.kick(hostSessionId, targetId, reason);
+
+    // Restart the revote with one fewer voter: same tied-leader ballot,
+    // fresh vote buffer, still DAY_VOTING. (The pardon/force choices clear
+    // the pending decision inside `endDay` via resetDayState; the kick
+    // choice stays in DAY_VOTING, so it clears it here.)
+    this.pendingTieDecision = null;
+    this.startRevote(pending.tiedLeaders);
   }
 
   /**
@@ -1169,6 +1426,12 @@ export class Engine {
     this.defenseOrder = [];
     this.currentDefenseIndex = -1;
     this.votes.clear();
+    // Ticket 08: the revote counter belongs to the day that just ended, and
+    // a pending host decision cannot survive into a new day (while one is
+    // pending the phase is frozen in DAY_VOTING, so reaching resetDayState
+    // means the decision was resolved).
+    this.revoteCount = 0;
+    this.pendingTieDecision = null;
     // `firstSpeakerId` and `firstSpeakerNominated` are intentionally NOT
     // reset here — `firstSpeakerId` carries across days so Day N+1's
     // rotation can anchor on Day N's first speaker. `firstSpeakerNominated`

@@ -65,7 +65,14 @@ export enum ActionType {
   PLAYER_RETURNED = "PLAYER_RETURNED",
   PHASE_ADVANCE = "PHASE_ADVANCE",
   PHASE_OVERRIDE = "PHASE_OVERRIDE",
+  TIE_ARBITRATION = "TIE_ARBITRATION",
 }
+
+/**
+ * Ticket 08: the three choices the host can make when the engine pauses a
+ * persistent 3+ way vote tie after `revoteCap` consecutive revotes (ADR 0006).
+ */
+export type TieArbitrationChoice = "auto-pardon" | "force-candidate" | "kick-player";
 
 /**
  * One entry in the host-only action log. The log is server-side memory;
@@ -138,17 +145,44 @@ export type DeathCause =
   | "KICKED";
 
 /**
- * Result of resolving a day cycle's voting round. The engine applies this
- * to the public schema (Player.isAlive, Player.votes) and returns a copy for
- * tests and for the action log entry.
+ * Result of resolving a day cycle's voting round (one `resolveVoting` call —
+ * including each revote round; ticket 08). The engine applies this to the
+ * public schema (Player.isAlive, Player.votes) and returns a copy for tests
+ * and for the action log entry.
+ *
+ * `outcome`:
+ *  - "eliminated"    — a single winner; `eliminatedId` is their sessionId.
+ *  - "auto-pardon"   — a 2-way tie (ADR 0003) or any tie when
+ *                      `revoteBehavior = "auto-pardon"`; nobody dies, the day
+ *                      ends, night falls.
+ *  - "revote"        — a 3+ way tie under `revoteBehavior =
+ *                      "host-arbitrates"` before the cap; a revote round among
+ *                      `tiedLeaders` just started (phase stays DAY_VOTING).
+ *  - "host-decision" — the revote cap was reached; the engine is paused
+ *                      awaiting the host's arbitration among `tiedLeaders`.
+ *  - "no-candidates" — nobody was nominated; no elimination (last speaker
+ *                      never wins from default votes alone when off-ballot).
  *
  * `eliminatedId` is the sessionId of the eliminated player, or empty string
- * when there were no candidates (no nominations → no elimination).
+ * when nobody was eliminated (auto-pardon / no-candidates / revote /
+ * host-decision).
  */
+export type VoteOutcome =
+  | "eliminated"
+  | "auto-pardon"
+  | "revote"
+  | "host-decision"
+  | "no-candidates";
+
 export interface VoteResolution {
+  outcome: VoteOutcome;
   eliminatedId: string;
   voteCounts: Record<string, number>;
   totalVotes: number;
+  /** The tied leaders, set when outcome is "revote" or "host-decision". */
+  tiedLeaders?: string[];
+  /** The 1-based number of the revote round that just started (outcome "revote"). */
+  revoteNumber?: number;
 }
 
 /**
@@ -179,6 +213,7 @@ export enum EngineErrorCode {
   PLAYER_MISSING = "PLAYER_MISSING",
   DOCTOR_RESTRICTION = "DOCTOR_RESTRICTION",
   GAME_LOCKED = "GAME_LOCKED",
+  VOTE_ALREADY_CAST = "VOTE_ALREADY_CAST",
 }
 
 export class EngineError extends Error {

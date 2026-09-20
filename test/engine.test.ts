@@ -3,7 +3,7 @@ import { MafiaState, Player } from "../src/rooms/schema/MafiaState.js";
 import { GamePhase, NightStep, Role, Team } from "../src/rooms/schema/enums.js";
 import { Engine } from "../src/game/Engine.js";
 import { PhaseTimer } from "../src/game/PhaseTimer.js";
-import { EngineErrorCode } from "../src/game/types.js";
+import { EngineErrorCode, type DeathCause } from "../src/game/types.js";
 
 /**
  * Helper: build a fresh MafiaState populated with `count` non-host players
@@ -915,11 +915,14 @@ describe("Engine — voting", () => {
     });
   });
 
-  it("a voter can re-vote; only the latest choice counts", () => {
+  it("votes are immutable: a second vote from the same actor is rejected", () => {
     const engine = inDay1Voting();
     engine.vote("p0", "p6");
-    engine.vote("p0", "p8");
-    assert.strictEqual(engine.getVote("p0"), "p8");
+    assert.throws(() => engine.vote("p0", "p8"), (err: unknown) => {
+      return (err as { code: string }).code === EngineErrorCode.VOTE_ALREADY_CAST;
+    });
+    // The original vote stands.
+    assert.strictEqual(engine.getVote("p0"), "p6");
   });
 });
 
@@ -1060,6 +1063,361 @@ describe("Engine — resolveVoting", () => {
     engine.startGame();
     assert.throws(() => engine.resolveVoting(), (err: unknown) => {
       return (err as { code: string }).code === EngineErrorCode.WRONG_PHASE;
+    });
+  });
+});
+
+// ─── Ticket 08: voting ties, revote loop, host arbitration ──────────
+
+describe("Engine — voting ties + revote (ticket 08)", () => {
+  /**
+   * Reach DAY_VOTING with all 10 players alive (the mafia victim is saved
+   * by the doctor) and `nominated` on the ballot.
+   */
+  function inDay1VotingWith(nominated: string[]): Engine {
+    const state = freshState(10);
+    const engine = new Engine(state);
+    engine.startGame();
+    engine._assignRoleForTest("p3", Role.DOCTOR);
+    engine.mafiaKill("host", "p4");
+    engine.doctorHeal("p3", "p4");
+    engine.resolveNight();
+    engine.startSpeeches();
+    for (const target of nominated) {
+      engine.nominate("p0", target);
+    }
+    const order = engine.getSpeakingOrder();
+    for (let i = 0; i < order.length; i++) engine.nextSpeaker();
+    const dOrder = engine.getDefenseOrder();
+    for (let i = 0; i < dOrder.length; i++) engine.nextDefense();
+    return engine;
+  }
+
+  /**
+   * Split the first 9 voters 3/3/3 across p6/p7/p8; p9 stays silent, so
+   * their default vote goes to the last speaker (themselves) — who is off
+   * the ballot — and lands on nobody, leaving a 3-way tie.
+   */
+  function castThreeWayTie(engine: Engine): void {
+    engine.vote("p0", "p6");
+    engine.vote("p1", "p6");
+    engine.vote("p2", "p6");
+    engine.vote("p3", "p7");
+    engine.vote("p4", "p7");
+    engine.vote("p5", "p7");
+    engine.vote("p6", "p8");
+    engine.vote("p7", "p8");
+    engine.vote("p8", "p8");
+  }
+
+  it("a 2-way tie auto-pardons: nobody dies, the day ends, night falls", () => {
+    const engine = inDay1VotingWith(["p6", "p7"]);
+    // 5 votes for p6, 5 for p7 — exactly 2 tied leaders.
+    for (let i = 0; i < 5; i++) engine.vote(`p${i}`, "p6");
+    for (let i = 5; i < 10; i++) engine.vote(`p${i}`, "p7");
+
+    const res = engine.resolveVoting();
+    assert.strictEqual(res.outcome, "auto-pardon");
+    assert.strictEqual(res.eliminatedId, "");
+    assert.strictEqual(res.voteCounts.p6, 5);
+    assert.strictEqual(res.voteCounts.p7, 5);
+    assert.strictEqual(engine.state.phase, GamePhase.NIGHT);
+    assert.strictEqual(engine.state.nightStep, NightStep.MAFIA);
+    assert.strictEqual(engine.state.players.get("p6")!.isAlive, true);
+    assert.strictEqual(engine.state.players.get("p7")!.isAlive, true);
+  });
+
+  it("a 3-way tie starts a revote among the tied leaders and narrows the ballot", () => {
+    const engine = inDay1VotingWith(["p5", "p6", "p7", "p8"]);
+    castThreeWayTie(engine);
+
+    const res = engine.resolveVoting();
+    assert.strictEqual(res.outcome, "revote");
+    assert.strictEqual(res.eliminatedId, "");
+    assert.deepStrictEqual(res.tiedLeaders, ["p6", "p7", "p8"]);
+    assert.strictEqual(res.revoteNumber, 1);
+    assert.strictEqual(res.totalVotes, 10);
+
+    // Phase stays DAY_VOTING for the revote round.
+    assert.strictEqual(engine.state.phase, GamePhase.DAY_VOTING);
+    assert.strictEqual(engine.getRevoteCount(), 1);
+
+    // The public ballot narrowed to the tied leaders; p5 (0 votes) is off it.
+    assert.deepStrictEqual([...engine.state.nominations], ["p6", "p7", "p8"]);
+    assert.strictEqual(engine.state.players.get("p5")!.isNominated, false);
+    assert.strictEqual(engine.state.players.get("p6")!.isNominated, true);
+
+    // Nobody died on the tie.
+    assert.strictEqual(engine.state.players.get("p6")!.isAlive, true);
+
+    // Round 2: fresh votes (p0 voted in round 1 — voting again proves the
+    // buffer was cleared). 5/3/2 → p6 is the single winner.
+    for (let i = 0; i < 5; i++) engine.vote(`p${i}`, "p6");
+    for (let i = 5; i < 8; i++) engine.vote(`p${i}`, "p7");
+    for (let i = 8; i < 10; i++) engine.vote(`p${i}`, "p8");
+    const res2 = engine.resolveVoting();
+    assert.strictEqual(res2.outcome, "eliminated");
+    assert.strictEqual(res2.eliminatedId, "p6");
+    assert.strictEqual(engine.state.phase, GamePhase.NIGHT);
+    assert.strictEqual(engine.state.players.get("p6")!.isAlive, false);
+    assert.strictEqual(engine.state.players.get("p7")!.isAlive, true);
+  });
+
+  it("a revote that ends in a 2-way tie auto-pardons (ADR 0003)", () => {
+    const engine = inDay1VotingWith(["p6", "p7", "p8"]);
+    castThreeWayTie(engine);
+    assert.strictEqual(engine.resolveVoting().outcome, "revote");
+
+    // Round 2: 5/5/0 — exactly 2 tied leaders → auto-pardon.
+    for (let i = 0; i < 5; i++) engine.vote(`p${i}`, "p6");
+    for (let i = 5; i < 10; i++) engine.vote(`p${i}`, "p7");
+
+    const res2 = engine.resolveVoting();
+    assert.strictEqual(res2.outcome, "auto-pardon");
+    assert.strictEqual(res2.eliminatedId, "");
+    assert.strictEqual(engine.state.phase, GamePhase.NIGHT);
+    assert.strictEqual(engine.state.players.get("p6")!.isAlive, true);
+    assert.strictEqual(engine.state.players.get("p7")!.isAlive, true);
+    assert.strictEqual(engine.state.players.get("p8")!.isAlive, true);
+  });
+
+  it("in a revote round a default vote for an off-ballot last speaker lands on nobody", () => {
+    const engine = inDay1VotingWith(["p6", "p7", "p8"]);
+    castThreeWayTie(engine);
+    const res1 = engine.resolveVoting();
+    assert.strictEqual(res1.outcome, "revote");
+    assert.strictEqual(res1.voteCounts.p6, 3);
+
+    // Round 2: nobody votes — all 10 defaults go to the off-ballot last
+    // speaker, every candidate stays at 0, and the 3-way tie repeats.
+    const res2 = engine.resolveVoting();
+    assert.strictEqual(res2.outcome, "revote");
+    assert.strictEqual(res2.revoteNumber, 2);
+    assert.strictEqual(res2.voteCounts.p6, 0);
+  });
+
+  it("pauses for a host decision after revoteCap consecutive 3+ way revotes", () => {
+    const engine = inDay1VotingWith(["p6", "p7", "p8"]); // default revoteCap = 3
+
+    // Rounds 1–3: each 3-way tie starts another revote.
+    for (let round = 1; round <= 3; round++) {
+      castThreeWayTie(engine);
+      const res = engine.resolveVoting();
+      assert.strictEqual(res.outcome, "revote", `round ${round}`);
+      assert.strictEqual(res.revoteNumber, round, `round ${round}`);
+    }
+    assert.strictEqual(engine.getRevoteCount(), 3);
+
+    // Round 4: another 3-way tie — the cap is exhausted, the engine pauses
+    // in DAY_VOTING with a pending host decision.
+    castThreeWayTie(engine);
+    const res4 = engine.resolveVoting();
+    assert.strictEqual(res4.outcome, "host-decision");
+    assert.deepStrictEqual(res4.tiedLeaders, ["p6", "p7", "p8"]);
+    assert.strictEqual(engine.state.phase, GamePhase.DAY_VOTING);
+    assert.deepStrictEqual(engine.getPendingTieDecision(), {
+      tiedLeaders: ["p6", "p7", "p8"],
+    });
+    assert.strictEqual(engine.getRevoteCount(), 3, "no new revote started");
+
+    // While paused, votes and re-resolution are rejected.
+    assert.throws(() => engine.vote("p9", "p6"), (err: unknown) => {
+      return (err as { code: string }).code === EngineErrorCode.WRONG_PHASE;
+    });
+    assert.throws(() => engine.resolveVoting(), (err: unknown) => {
+      return (err as { code: string }).code === EngineErrorCode.WRONG_PHASE;
+    });
+  });
+
+  it("a lower revoteCap reaches the host decision sooner", () => {
+    const engine = inDay1VotingWith(["p6", "p7", "p8"]);
+    engine.state.revoteCap = 1;
+
+    castThreeWayTie(engine);
+    assert.strictEqual(engine.resolveVoting().outcome, "revote");
+
+    castThreeWayTie(engine);
+    assert.strictEqual(engine.resolveVoting().outcome, "host-decision");
+  });
+
+  it("revoteBehavior auto-pardon short-circuits a 3+ way tie with no host step", () => {
+    const engine = inDay1VotingWith(["p6", "p7", "p8"]);
+    engine.state.revoteBehavior = "auto-pardon";
+
+    castThreeWayTie(engine);
+    const res = engine.resolveVoting();
+    assert.strictEqual(res.outcome, "auto-pardon");
+    assert.strictEqual(engine.state.phase, GamePhase.NIGHT);
+    assert.strictEqual(engine.getRevoteCount(), 0);
+    assert.strictEqual(engine.getPendingTieDecision(), null);
+    assert.strictEqual(engine.state.players.get("p6")!.isAlive, true);
+  });
+
+  describe("host arbitration (ADR 0006)", () => {
+    /**
+     * A room with revoteCap = 1 driven one revote past the cap: the engine
+     * is paused in DAY_VOTING with a pending decision among p6/p7/p8.
+     */
+    function withPendingDecision(): Engine {
+      const engine = inDay1VotingWith(["p6", "p7", "p8"]);
+      engine.state.revoteCap = 1;
+      castThreeWayTie(engine);
+      assert.strictEqual(engine.resolveVoting().outcome, "revote");
+      castThreeWayTie(engine);
+      assert.strictEqual(engine.resolveVoting().outcome, "host-decision");
+      return engine;
+    }
+
+    it("auto-pardon choice ends the day with nobody eliminated", () => {
+      const engine = withPendingDecision();
+      let deaths = 0;
+      engine.setOnPlayerDied(() => {
+        deaths += 1;
+      });
+
+      engine.resolveTieByPardon("host");
+
+      assert.strictEqual(engine.state.phase, GamePhase.NIGHT);
+      assert.strictEqual(engine.getPendingTieDecision(), null);
+      for (let i = 0; i < 10; i++) {
+        assert.strictEqual(engine.state.players.get(`p${i}`)!.isAlive, true);
+      }
+      assert.strictEqual(deaths, 0);
+    });
+
+    it("force-candidate eliminates one of the tied leaders through the vote path", () => {
+      const engine = withPendingDecision();
+      const deaths: { id: string; cause: DeathCause }[] = [];
+      engine.setOnPlayerDied((id, cause) => deaths.push({ id, cause }));
+
+      engine.resolveTieByForce("host", "p7");
+
+      assert.strictEqual(engine.state.phase, GamePhase.NIGHT);
+      assert.strictEqual(engine.state.players.get("p7")!.isAlive, false);
+      assert.strictEqual(engine.state.players.get("p6")!.isAlive, true);
+      assert.strictEqual(engine.state.players.get("p8")!.isAlive, true);
+      assert.deepStrictEqual(deaths, [{ id: "p7", cause: "VOTE_ELIMINATION" }]);
+      assert.strictEqual(engine.getPendingTieDecision(), null);
+    });
+
+    it("force-candidate rejects a target that is not a tied leader", () => {
+      const engine = withPendingDecision();
+      assert.throws(() => engine.resolveTieByForce("host", "p2"), (err: unknown) => {
+        return (err as { code: string }).code === EngineErrorCode.WRONG_ROLE;
+      });
+      assert.strictEqual(engine.state.phase, GamePhase.DAY_VOTING);
+    });
+
+    it("kick-player ejects a non-tied player and restarts the revote with one fewer voter", () => {
+      const engine = withPendingDecision();
+      const deaths: { id: string; cause: DeathCause }[] = [];
+      engine.setOnPlayerDied((id, cause) => deaths.push({ id, cause }));
+
+      engine.resolveTieByKick("host", "p2", "stalling the vote");
+
+      // p2 was ejected through ticket 06's kick path.
+      assert.strictEqual(engine.state.players.get("p2")!.isAlive, false);
+      assert.ok(
+        deaths.some((d) => d.id === "p2" && d.cause === "KICKED"),
+        "kick seam fires with KICKED",
+      );
+
+      // Still DAY_VOTING: the tied leaders revote with one fewer voter.
+      assert.strictEqual(engine.state.phase, GamePhase.DAY_VOTING);
+      assert.strictEqual(engine.getPendingTieDecision(), null);
+      assert.deepStrictEqual([...engine.state.nominations], ["p6", "p7", "p8"]);
+
+      // 9 voters remain (p2 is dead): 4/3/2 → p6 is the single winner.
+      engine.vote("p0", "p6");
+      engine.vote("p1", "p6");
+      engine.vote("p3", "p6");
+      engine.vote("p4", "p6");
+      engine.vote("p5", "p7");
+      engine.vote("p6", "p7");
+      engine.vote("p9", "p7");
+      engine.vote("p7", "p8");
+      engine.vote("p8", "p8");
+
+      const res = engine.resolveVoting();
+      assert.strictEqual(res.outcome, "eliminated");
+      assert.strictEqual(res.eliminatedId, "p6");
+      assert.strictEqual(res.totalVotes, 9);
+      assert.strictEqual(engine.state.phase, GamePhase.NIGHT);
+      assert.strictEqual(engine.state.players.get("p6")!.isAlive, false);
+    });
+
+    it("kick-player rejects a tied leader (use force-candidate instead)", () => {
+      const engine = withPendingDecision();
+      assert.throws(() => engine.resolveTieByKick("host", "p6", "reason"), (err: unknown) => {
+        return (err as { code: string }).code === EngineErrorCode.WRONG_ROLE;
+      });
+      // Nothing changed: no one dead, still paused.
+      assert.strictEqual(engine.state.players.get("p6")!.isAlive, true);
+      assert.ok(engine.getPendingTieDecision());
+    });
+
+    it("arbitration is rejected when no decision is pending", () => {
+      const engine = inDay1VotingWith(["p6", "p7", "p8"]);
+      assert.throws(() => engine.resolveTieByPardon("host"), (err: unknown) => {
+        return (err as { code: string }).code === EngineErrorCode.WRONG_PHASE;
+      });
+      assert.throws(() => engine.resolveTieByForce("host", "p6"), (err: unknown) => {
+        return (err as { code: string }).code === EngineErrorCode.WRONG_PHASE;
+      });
+      assert.throws(() => engine.resolveTieByKick("host", "p0", "reason"), (err: unknown) => {
+        return (err as { code: string }).code === EngineErrorCode.WRONG_PHASE;
+      });
+    });
+
+    it("arbitration requires the host", () => {
+      const engine = withPendingDecision();
+      assert.throws(() => engine.resolveTieByPardon("p0"), (err: unknown) => {
+        return (err as { code: string }).code === EngineErrorCode.NOT_HOST;
+      });
+      assert.ok(engine.getPendingTieDecision(), "still pending after a non-host attempt");
+    });
+
+    it("a new day resets the revote counter so fresh revotes are granted", () => {
+      const engine = withPendingDecision(); // revoteCap = 1, cap exhausted on day 1
+      engine.resolveTieByPardon("host");
+
+      // Walk day 2 back into DAY_VOTING: kill p4 (the doctor must pick a
+      // different target this time), then speeches → BALAGAN (day 2+) →
+      // defense → voting.
+      engine.mafiaKill("host", "p4");
+      engine.doctorHeal("p3", "p5");
+      engine.resolveNight();
+      engine.startSpeeches();
+      // Day 2's first speaker is p1 (the seat after day 1's p0); the
+      // first-word rule requires them to nominate.
+      engine.nominate("p1", "p6");
+      engine.nominate("p1", "p7");
+      engine.nominate("p1", "p8");
+      const order = engine.getSpeakingOrder();
+      for (let i = 0; i < order.length; i++) engine.nextSpeaker();
+      assert.strictEqual(engine.state.phase, GamePhase.DAY_BALAGAN);
+      engine.skipPhase("host"); // end the debate early → DAY_DEFENSE
+      const dOrder = engine.getDefenseOrder();
+      for (let i = 0; i < dOrder.length; i++) engine.nextDefense();
+      assert.strictEqual(engine.state.phase, GamePhase.DAY_VOTING);
+
+      assert.strictEqual(engine.getRevoteCount(), 0);
+      assert.strictEqual(engine.getPendingTieDecision(), null);
+
+      // 9 voters remain (p4 is dead): a 3-way tie starts revote #1 again
+      // instead of going straight back to the host.
+      engine.vote("p0", "p6");
+      engine.vote("p1", "p6");
+      engine.vote("p2", "p6");
+      engine.vote("p3", "p7");
+      engine.vote("p5", "p7");
+      engine.vote("p6", "p7");
+      engine.vote("p7", "p8");
+      engine.vote("p8", "p8");
+      engine.vote("p9", "p8");
+      const res = engine.resolveVoting();
+      assert.strictEqual(res.outcome, "revote");
+      assert.strictEqual(res.revoteNumber, 1);
     });
   });
 });

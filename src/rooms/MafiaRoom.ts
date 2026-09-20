@@ -9,6 +9,8 @@ import {
   EngineErrorCode,
   PingRecord,
   SheriffCheckResult,
+  TieArbitrationChoice,
+  VoteResolution,
 } from "../game/types.js";
 
 const INVITE_TTL_MS = 1000 * 60 * 60 * 6;
@@ -175,7 +177,56 @@ export class MafiaRoom extends Room {
     },
     resolveVoting: (client: Client) => {
       if (!this.requireHost(client)) return;
-      this.runEngine(() => this.engine.resolveVoting(), client);
+      // Direct try/catch (like donCheck) — runEngine swallows the return
+      // value and we need the resolution to detect the revote-cap outcome.
+      let resolution: VoteResolution;
+      try {
+        resolution = this.engine.resolveVoting();
+      } catch (e) {
+        this.fail(client, this.engineErrorMessage(e));
+        return;
+      }
+      // Ticket 08: when the revote cap is reached the engine pauses and the
+      // host gets a real-time decision prompt (on top of the
+      // `revote_cap_reached` entry in the action log).
+      if (resolution.outcome === "host-decision") {
+        const host = this.findHostClient();
+        host?.send("revoteCapReached", {
+          tiedLeaders: resolution.tiedLeaders ?? [],
+          revoteCap: this.state.revoteCap,
+        });
+      }
+    },
+    // Ticket 08: the host's answer to the revoteCapReached prompt (ADR 0006).
+    arbitrateTie: (
+      client: Client,
+      payload: { choice: TieArbitrationChoice; targetId?: string; reason?: string },
+    ) => {
+      if (!this.requireHost(client)) return;
+      const choice = payload?.choice;
+      if (
+        choice !== "auto-pardon" &&
+        choice !== "force-candidate" &&
+        choice !== "kick-player"
+      ) {
+        this.fail(client, "choice must be auto-pardon, force-candidate, or kick-player");
+        return;
+      }
+      if (choice !== "auto-pardon" && typeof payload?.targetId !== "string") {
+        this.fail(client, "targetId is required for force-candidate and kick-player");
+        return;
+      }
+      const targetId = payload?.targetId ?? "";
+      const reason = typeof payload?.reason === "string" ? payload.reason : "";
+      this.runEngine(() => {
+        if (choice === "auto-pardon") {
+          this.engine.resolveTieByPardon(client.sessionId);
+        } else if (choice === "force-candidate") {
+          this.engine.resolveTieByForce(client.sessionId, targetId);
+        } else {
+          this.engine.resolveTieByKick(client.sessionId, targetId, reason);
+        }
+      }, client);
     },
     pausePhase: (client: Client) => {
       if (!this.requireHost(client)) return;
@@ -261,11 +312,35 @@ export class MafiaRoom extends Room {
     },
   };
 
-  onCreate(options: { password: string }) {
+  onCreate(options: {
+    password?: string;
+    revoteCap?: number;
+    revoteBehavior?: string;
+  }) {
     this.inviteCreatedAt = Date.now();
     if (options.password) {
       this.password = options.password;
       this.setMatchmaking({ unlisted: true });
+    }
+
+    // Ticket 08: room-creation voting settings (ADR 0006). Invalid values
+    // fail room creation — a room configured differently than requested
+    // should not start. Defaults live on the MafiaState schema (cap 3,
+    // "host-arbitrates").
+    if (options.revoteCap !== undefined) {
+      if (!Number.isInteger(options.revoteCap) || options.revoteCap < 1) {
+        throw new Error("revoteCap must be a positive integer");
+      }
+      this.state.revoteCap = options.revoteCap;
+    }
+    if (options.revoteBehavior !== undefined) {
+      if (
+        options.revoteBehavior !== "host-arbitrates" &&
+        options.revoteBehavior !== "auto-pardon"
+      ) {
+        throw new Error('revoteBehavior must be "host-arbitrates" or "auto-pardon"');
+      }
+      this.state.revoteBehavior = options.revoteBehavior;
     }
 
     // Subscribe to the engine's death seam (ticket 03). Today the seam is a
@@ -491,6 +566,8 @@ export class MafiaRoom extends Room {
           return "Гравця не знайдено";
         case EngineErrorCode.DOCTOR_RESTRICTION:
           return "Лікар не може лікувати того самого гравця дві ночі поспіль";
+        case EngineErrorCode.VOTE_ALREADY_CAST:
+          return "Ваш голос уже віддано";
         case EngineErrorCode.GAME_LOCKED:
           return e.message;
       }
