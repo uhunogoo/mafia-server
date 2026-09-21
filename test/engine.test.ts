@@ -2397,20 +2397,7 @@ describe("Engine — Day 2+ BALAGAN + first-word rule (ticket 07)", () => {
     const state = freshState(10);
     const engine = new Engine(state);
     engine.startGame();
-    // ADR 0007 / ticket 02: pin ALL 10 roles deterministically so the
-    // late-freeze tests can kick or vote out p0/p1/p6 mid-BALAGAN or mid-day
-    // without triggering a victory check. Only p7/p8/p9 are BLACK; the
-    // rest are RED. p3 is the DOCTOR (the doctor heal is exercised below).
-    engine._assignRoleForTest("p0", Role.CIVILIAN);
-    engine._assignRoleForTest("p1", Role.CIVILIAN);
-    engine._assignRoleForTest("p2", Role.SHERIFF);
     engine._assignRoleForTest("p3", Role.DOCTOR);
-    engine._assignRoleForTest("p4", Role.CIVILIAN);
-    engine._assignRoleForTest("p5", Role.CIVILIAN);
-    engine._assignRoleForTest("p6", Role.CIVILIAN);
-    engine._assignRoleForTest("p7", Role.DON);
-    engine._assignRoleForTest("p8", Role.MAFIA);
-    engine._assignRoleForTest("p9", Role.MAFIA);
     // Mafia kills p4; Doctor saves p4 so all 10 players remain alive for the
     // speaking-order / first-word rotation tests.
     engine.mafiaKill("host", "p4");
@@ -2455,10 +2442,14 @@ describe("Engine — Day 2+ BALAGAN + first-word rule (ticket 07)", () => {
    * Note: the resolved elimination target is the implicit last speaker
    * (p0, the seat that wraps around the rotation), NOT the nominated p6
    * — all default votes go to the last speaker, who isn't on the
-   * nomination list. p6 stays alive, p0 dies. With deterministic roles
-   * (p0 = CIVILIAN, p7/p8/p9 = BLACK), the vote does not trigger victory.
+   * nomination list. p6 stays alive, p0 dies. We pin p0=CIVILIAN here so
+   * the Day 2 vote cannot trigger civilian victory by accidentally
+   * eliminating a BLACK anchor under random role assignment (driveDay1
+   * stays untouched per ticket 02 / decision 11 — this pin lives here
+   * because driveDay2 is the only helper whose resolveVoting kills p0).
    */
   function driveDay2(engine: Engine): void {
+    engine._assignRoleForTest("p0", Role.CIVILIAN);
     // ADR 0007: on Day 2+ startSpeeches opens BALAGAN; skipping it opens the
     // speech round and freezes the roster.
     engine.startSpeeches();

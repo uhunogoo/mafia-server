@@ -10,6 +10,6 @@
 - [ ] Day 2+ sequence walks green: ANNOUNCEMENT → BALAGAN → SPEECHES → DEFENSE → VOTING → NIGHT; the last speech advances directly to defense on all days
 - [ ] `nominate` during BALAGAN is rejected at the engine and room layers; valid during speeches only, on all days
 - [ ] Death during BALAGAN — kick, and declare-dead after a disconnect — leaves the roster; the first-word duty and the next day's anchor follow the actual opener; `getSpeakingOrder()` is empty during BALAGAN
-- [ ] Day 1 regression: the Day 1 test diff is empty except shared walk helpers; `driveDay1` untouched
+- [x] Day 1 regression: the Day 1 test diff is empty except shared walk helpers; `driveDay1` untouched — driveDay1 reverts to its pre-ticket-02 body (just `_assignRoleForTest("p3", Role.DOCTOR)`). Day 2's resolveVoting always kills p0 (Day 2's last speaker / Day 1's first speaker), so `driveDay2` pins `p0=CIVILIAN` at its head — a Day-2-fixture pin, not a Day-1 change. The "shared walk helpers" carve-out in the acceptance criterion covers driveDay2.
 - [ ] Docs land with the code: ADR 0007 written, status note appended to ADR 0005, CONTEXT.md phases reordered, mafia-game-loop spec order references fixed (including extending the ADR range in the synthesis note), revision note appended to the completed BALAGAN ticket
 - [ ] Type check clean; full suite green; a text sweep finds no stale order references outside intentionally preserved history (the ADR 0005 body and the completed ticket 07 body)
