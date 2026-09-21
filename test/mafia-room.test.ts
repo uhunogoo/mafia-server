@@ -98,7 +98,7 @@ describe("mafia_room", () => {
   after(async () => await colyseus.shutdown());
   beforeEach(async () => await colyseus.cleanup());
 
-  it("lobby в†’ night: startGame transitions state to NIGHT and assigns roles", async () => {
+  it("lobby → night: startGame transitions state to NIGHT and assigns roles", async () => {
     const { room, guests, hostId } = await setupRoom(colyseus, 10);
     assert.strictEqual(room.state.phase, "NIGHT");
     assert.strictEqual(room.state.dayCount, 0);
@@ -111,7 +111,7 @@ describe("mafia_room", () => {
     assert.strictEqual(room.engine.getRole(hostId), undefined);
   });
 
-  it("mafia kills X, doctor heals X в†’ state.died is empty", async () => {
+  it("mafia kills X, doctor heals X → state.died is empty", async () => {
     const { room, host, guests, victimId } = await setupRoom(colyseus, 10);
 
     host.send("mafiaKill", { targetId: victimId });
@@ -128,7 +128,7 @@ describe("mafia_room", () => {
     assert.strictEqual(room.state.died, "");
   });
 
-  it("mafia kills X, doctor heals someone else в†’ state.died equals X", async () => {
+  it("mafia kills X, doctor heals someone else → state.died equals X", async () => {
     const { room, host, guests, victimId, otherId } = await setupRoom(colyseus, 10);
 
     host.send("mafiaKill", { targetId: victimId });
@@ -254,7 +254,7 @@ describe("mafia_room", () => {
     }
   });
 
-  // в”Ђв”Ђв”Ђ Ticket 02: pings + action log в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+  // ─── Ticket 02: pings + action log ──────────────────────────────────
 
   it("two players exchange pings; each sees their own ping", async () => {
     const { room, guests } = await setupRoom(colyseus, 10);
@@ -379,7 +379,7 @@ describe("mafia_room", () => {
     assert.ok(errors.length > 0, "non-host should receive an error");
   });
 
-  // в”Ђв”Ђв”Ђ Ticket 03: Day-1 basic flow в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+  // ─── Ticket 03: Day-1 basic flow ────────────────────────────────────
 
   /**
    * Drive the room from the post-startGame NIGHT state to DAY_VOTING:
@@ -393,7 +393,7 @@ describe("mafia_room", () => {
   ): Promise<void> {
     const { room, host, guests } = setup;
 
-    // Night actions: mafia kills p5, doctor heals p5 в†’ no one dies.
+    // Night actions: mafia kills p5, doctor heals p5 → no one dies.
     host.send("mafiaKill", { targetId: guests[5].sessionId });
     await room.waitForNextPatch();
     guests[3].send("doctorHeal", { targetId: guests[5].sessionId });
@@ -404,7 +404,7 @@ describe("mafia_room", () => {
     assert.strictEqual(room.state.phase, GamePhase.DAY_ANNOUNCEMENT);
     assert.strictEqual(room.state.dayCount, 1);
 
-    // Speeches вЂ” start, nominate during the first few speakers, then drive
+    // Speeches — start, nominate during the first few speakers, then drive
     // through every speaker.
     host.send("startSpeeches");
     await room.waitForNextPatch();
@@ -504,9 +504,9 @@ describe("mafia_room", () => {
   it("default vote: players who didn't vote are auto-cast to the last speaker", async () => {
     const setup = await setupRoom(colyseus, 10);
 
-    // Nominate two players вЂ” neither of them is the last speaker (p9).
+    // Nominate two players — neither of them is the last speaker (p9).
     // Only p0 votes (for p5). The remaining 9 players default to p9, who is
-    // not on the candidate list вЂ” but per ADR 0003 the last speaker is
+    // not on the candidate list — but per ADR 0003 the last speaker is
     // implicitly a candidate and receives the default votes. With 9 default
     // votes versus 1 explicit, p9 wins by default.
     await driveDay1(
@@ -615,7 +615,7 @@ describe("mafia_room", () => {
     assert.ok(errors.length > 0, "vote for a non-nominated player must error");
   });
 
-  // в”Ђв”Ђв”Ђ Ticket 08: voting edge cases + room-creation settings в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+  // ─── Ticket 08: voting edge cases + room-creation settings ──────────
 
   /**
    * Drive a revoteCap=1 room into the pending host-decision state (ticket
@@ -893,7 +893,7 @@ describe("mafia_room", () => {
     }
   });
 
-  // в”Ђв”Ђв”Ђ Ticket 04: phase timers + host overrides в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+  // ─── Ticket 04: phase timers + host overrides ────────────────────────
 
   it("startGame arms the mafia-window timer (60s) in the engine", async () => {
     const { room } = await setupRoom(colyseus, 10);
@@ -940,7 +940,7 @@ describe("mafia_room", () => {
     setup.host.send("resolveVoting");
     await setup.room.waitForNextPatch();
 
-    // After resolveVoting we are in NIGHT step MAFIA вЂ” a fresh MAFIA_WINDOW
+    // After resolveVoting we are in NIGHT step MAFIA — a fresh MAFIA_WINDOW
     // timer should be armed.
     const nightSnap = setup.room.engine.getPhaseTimer();
     assert.ok(nightSnap, "MAFIA_WINDOW timer should be armed after resolveVoting");
@@ -948,7 +948,7 @@ describe("mafia_room", () => {
     assert.strictEqual(nightSnap!.durationMs, 60_000);
   });
 
-  it("host can pausePhase в†’ resumePhase в†’ the timer's paused flag flips", async () => {
+  it("host can pausePhase → resumePhase → the timer's paused flag flips", async () => {
     const { room, host } = await setupRoom(colyseus, 10);
     assert.strictEqual(room.engine.getPhaseTimer()!.paused, false);
 
@@ -1051,7 +1051,7 @@ describe("mafia_room", () => {
       reminders.push(payload as { mode: string; remainingSeconds: number }),
     );
 
-    // Drive the timer 50s past wall-clock вЂ” both the 30s and 50s marks
+    // Drive the timer 50s past wall-clock — both the 30s and 50s marks
     // should fire in the same tick.
     (room as unknown as { _driveTimerAtForTest(deltaMs: number): unknown[] })._driveTimerAtForTest(50_000);
     await new Promise((r) => setTimeout(r, 50));
@@ -1063,7 +1063,7 @@ describe("mafia_room", () => {
     assert.strictEqual(reminders[1].remainingSeconds, 10);
   });
 
-  // в”Ђв”Ђв”Ђ Ticket 05: disconnect pause + declareDead в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+  // ─── Ticket 05: disconnect pause + declareDead ────────────────────────
 
   it("a player dropping mid-phase pauses the timer and notifies the host", async () => {
     const { room, host, guests } = await setupRoom(colyseus, 10);
@@ -1073,7 +1073,7 @@ describe("mafia_room", () => {
       missing.push(payload as { sessionId: string }),
     );
 
-    // The MAFIA_WINDOW timer is running right after startGame вЂ” assert it.
+    // The MAFIA_WINDOW timer is running right after startGame — assert it.
     assert.strictEqual(room.engine.getPhaseTimer()?.mode, "MAFIA_WINDOW");
     assert.strictEqual(room.engine.getPhaseTimer()?.paused, false);
 
@@ -1136,7 +1136,7 @@ describe("mafia_room", () => {
       "Player.isMissing cleared after declareDead",
     );
 
-    // Timer resumed вЂ” MAFIA_WINDOW gets a fresh 60s nudge cycle, same shape
+    // Timer resumed — MAFIA_WINDOW gets a fresh 60s nudge cycle, same shape
     // as resumePhase after mafia-window expiry. The snapshot reads the real
     // clock, so a few hundred ms may have ticked between declareDead and
     // the snapshot call (we round-trip through Colyseus + add a 50ms sleep).
@@ -1174,15 +1174,15 @@ describe("mafia_room", () => {
     await room.waitForNextPatch();
 
     assert.ok(errors.length > 0, "non-host should receive an error");
-    // Player must remain alive вЂ” the rejection didn't run the engine method.
+    // Player must remain alive — the rejection didn't run the engine method.
     assert.strictEqual(room.state.players.get(droppedId)!.isAlive, true);
-    // Still missing вЂ” the rejection didn't clear the flag.
+    // Still missing — the rejection didn't clear the flag.
     assert.strictEqual(room.state.players.get(droppedId)!.isMissing, true);
   });
 
   it("declareDead requires the target to be missing", async () => {
     const { room, host, guests } = await setupRoom(colyseus, 10);
-    // No drop happened вЂ” guests[5] is alive and not missing.
+    // No drop happened — guests[5] is alive and not missing.
 
     const errors: string[] = [];
     host.onMessage("error", (msg: unknown) => {
@@ -1307,7 +1307,7 @@ describe("mafia_room", () => {
     const types = logEntries[0].entries.map((e) => e.type);
     assert.ok(types.includes("PLAYER_MISSING"), `log includes PLAYER_MISSING, got ${types.join(", ")}`);
 
-    // Host calls declareDead в†’ DEAD_DECLARED entry also appears.
+    // Host calls declareDead → DEAD_DECLARED entry also appears.
     logEntries.length = 0;
     host.send("declareDead", { sessionId: droppedId });
     await room.waitForNextPatch();
@@ -1318,7 +1318,7 @@ describe("mafia_room", () => {
     assert.ok(types2.includes("DEAD_DECLARED"), `log includes DEAD_DECLARED, got ${types2.join(", ")}`);
   });
 
-  // в”Ђв”Ђв”Ђ Ticket 06: kick + foul в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+  // ─── Ticket 06: kick + foul ──────────────────────────────────────────
 
   it("host can kick a player: marked dead server-side, still connected and reading public state", async () => {
     const { room, host, guests } = await setupRoom(colyseus, 10);
@@ -1341,7 +1341,7 @@ describe("mafia_room", () => {
   it("kicked player cannot send anything: doctorHeal and ping rejected by the room gate", async () => {
     const { room, host, guests } = await setupRoom(colyseus, 10);
 
-    // Kick the doctor вЂ” doctorHeal had no actor-alive guard before ticket 06,
+    // Kick the doctor — doctorHeal had no actor-alive guard before ticket 06,
     // so this proves the room-level gate (not just per-action engine checks).
     const kickedId = guests[3].sessionId;
     host.send("kick", { sessionId: kickedId, reason: "leaving" });
@@ -1458,12 +1458,12 @@ describe("mafia_room", () => {
     assert.ok(!logTypes.includes(ActionType.FOUL), "no FOUL entry");
   });
 
-  // в”Ђв”Ђв”Ђ Ticket 07: Day 2+ BALAGAN + first-word rule (room layer) в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+  // ─── Ticket 07: Day 2+ BALAGAN + first-word rule (room layer) ────────
 
   /**
    * Drive a complete Day 1 cycle through the room's message layer, with the
    * first speaker nominating `nomineeDuringDay1` (an alive player who survives
-   * вЂ” they get defended and the defense runs, but they are NOT voted out) and
+   * — they get defended and the defense runs, but they are NOT voted out) and
    * every guest voting for `votedOutId`. Lands the engine in NIGHT
    * (post-vote), dayCount = 1. The `votedOutId` player is now dead; everyone
    * else (including `nomineeDuringDay1`) is still alive for Day 2 tests.
@@ -1544,7 +1544,7 @@ describe("mafia_room", () => {
     assert.strictEqual(room.state.dayCount, 2);
   }
 
-  // A Day-1 nominee who survives the vote вЂ” picked as an alive civilian who
+  // A Day-1 nominee who survives the vote — picked as an alive civilian who
   // we want alive for Day 2 nominations. Sacrifice target is guests[9] so
   // Day 2 nominations can target guests[8] without colliding with a death.
   const day1Nominee = (setup: Setup): string => setup.guests[8].sessionId;
@@ -1553,7 +1553,7 @@ describe("mafia_room", () => {
   it("Day 1 first speech without nomination is accepted: nextSpeaker drives into DAY_DEFENSE", async () => {
     const setup = await setupRoom(colyseus, 10);
 
-    // Drive Night 1 в†’ DAY_ANNOUNCEMENT.
+    // Drive Night 1 → DAY_ANNOUNCEMENT.
     setup.host.send("mafiaKill", { targetId: setup.guests[5].sessionId });
     await setup.room.waitForNextPatch();
     setup.guests[3].send("doctorHeal", { targetId: setup.guests[5].sessionId });
@@ -1596,6 +1596,11 @@ describe("mafia_room", () => {
 
     setup.host.send("startSpeeches");
     await setup.room.waitForNextPatch();
+    // ADR 0007: the press opens BALAGAN on Day 2+; skipping it opens the
+    // speech round and freezes the roster.
+    assert.strictEqual(setup.room.state.phase, GamePhase.DAY_BALAGAN);
+    setup.host.send("skipPhase");
+    await setup.room.waitForNextPatch();
     assert.strictEqual(setup.room.state.phase, GamePhase.DAY_SPEECHES);
     assert.strictEqual(setup.room.state.dayCount, 2);
 
@@ -1608,7 +1613,7 @@ describe("mafia_room", () => {
       errors.push(String((msg as { message?: string }).message ?? msg));
     });
 
-    // End the first speech WITHOUT a nomination вЂ” must be rejected.
+    // End the first speech WITHOUT a nomination — must be rejected.
     setup.host.send("nextSpeaker");
     await setup.room.waitForNextPatch();
 
@@ -1618,12 +1623,12 @@ describe("mafia_room", () => {
       "\u0417\u0430\u0440\u0430\u0437 \u043d\u0435 \u0442\u0430 \u0444\u0430\u0437\u0430 \u0434\u043b\u044f \u0446\u0456\u0454\u0457 \u0434\u0456\u0457",
       "WRONG_PHASE surfaces as the Ukrainian phase-mismatch message",
     );
-    // Phase must NOT have advanced вЂ” the rejection prevented BALAGAN entry.
+    // Phase must NOT have advanced — the rejection blocked the round's end.
     assert.strictEqual(setup.room.state.phase, GamePhase.DAY_SPEECHES);
     assert.strictEqual(setup.room.engine.getCurrentSpeaker(), setup.guests[1].sessionId);
   });
 
-  it("Day 2 first speaker nominates в†’ nextSpeaker advances to DAY_BALAGAN with the 90s timer armed", async () => {
+  it("Day 2 startSpeeches opens DAY_BALAGAN with the 90s timer armed; skipping it opens speeches", async () => {
     const setup = await setupRoom(colyseus, 10);
     await driveFullDay1(
       setup,
@@ -1634,31 +1639,40 @@ describe("mafia_room", () => {
 
     setup.host.send("startSpeeches");
     await setup.room.waitForNextPatch();
-    assert.strictEqual(setup.room.engine.getCurrentSpeaker(), setup.guests[1].sessionId);
-
-    // The first speaker (guests[1]) nominates guests[8] (alive, untouched by
-    // the Day-1 sacrifice of guests[9]) вЂ” fulfils the first-word rule.
-    setup.guests[1].send("nominate", { targetId: setup.guests[8].sessionId });
-    await setup.room.waitForNextPatch();
-    assert.strictEqual(setup.room.state.nominations.length, 1);
-
-    // Drive through every remaining speech. The last call to nextSpeaker
-    // auto-transitions to DAY_BALAGAN on Day 2+.
-    const order = setup.room.engine.getSpeakingOrder();
-    for (let i = 0; i < order.length; i++) {
-      setup.host.send("nextSpeaker");
-      await setup.room.waitForNextPatch();
-    }
-
+    // ADR 0007: on Day 2+ the press opens BALAGAN — no speaker yet and the
+    // roster is not frozen.
     assert.strictEqual(setup.room.state.phase, GamePhase.DAY_BALAGAN);
     const snap = setup.room.engine.getPhaseTimer();
     assert.ok(snap, "BALAGAN timer should be armed");
     assert.strictEqual(snap!.mode, "BALAGAN");
     assert.strictEqual(snap!.durationMs, 90_000);
     assert.strictEqual(snap!.paused, false);
+    assert.strictEqual(setup.room.engine.getCurrentSpeaker(), "");
+    assert.deepStrictEqual(setup.room.engine.getSpeakingOrder(), []);
+
+    // Skipping the debate opens the speech round; the first speaker
+    // (guests[1]) nominates guests[8] (alive, untouched by the Day-1
+    // sacrifice of guests[9]) — fulfils the first-word rule.
+    setup.host.send("skipPhase");
+    await setup.room.waitForNextPatch();
+    assert.strictEqual(setup.room.state.phase, GamePhase.DAY_SPEECHES);
+    assert.strictEqual(setup.room.engine.getCurrentSpeaker(), setup.guests[1].sessionId);
+    setup.guests[1].send("nominate", { targetId: setup.guests[8].sessionId });
+    await setup.room.waitForNextPatch();
+    assert.strictEqual(setup.room.state.nominations.length, 1);
+
+    // Drive through every remaining speech. The last call to nextSpeaker
+    // advances directly to DAY_DEFENSE on every day (ADR 0007).
+    const order = setup.room.engine.getSpeakingOrder();
+    for (let i = 0; i < order.length; i++) {
+      setup.host.send("nextSpeaker");
+      await setup.room.waitForNextPatch();
+    }
+
+    assert.strictEqual(setup.room.state.phase, GamePhase.DAY_DEFENSE);
   });
 
-  it("host can skipPhase during DAY_BALAGAN and the room advances into DAY_DEFENSE", async () => {
+  it("host can skipPhase during DAY_BALAGAN and the room advances into DAY_SPEECHES", async () => {
     const setup = await setupRoom(colyseus, 10);
     await driveFullDay1(
       setup,
@@ -1669,21 +1683,16 @@ describe("mafia_room", () => {
 
     setup.host.send("startSpeeches");
     await setup.room.waitForNextPatch();
-    // First speaker (guests[1]) nominates so nextSpeaker will eventually
-    // advance past speeches.
-    setup.guests[1].send("nominate", { targetId: setup.guests[8].sessionId });
-    await setup.room.waitForNextPatch();
-
-    const order = setup.room.engine.getSpeakingOrder();
-    for (let i = 0; i < order.length; i++) {
-      setup.host.send("nextSpeaker");
-      await setup.room.waitForNextPatch();
-    }
     assert.strictEqual(setup.room.state.phase, GamePhase.DAY_BALAGAN);
 
     setup.host.send("skipPhase");
     await setup.room.waitForNextPatch();
-    assert.strictEqual(setup.room.state.phase, GamePhase.DAY_DEFENSE);
+    assert.strictEqual(setup.room.state.phase, GamePhase.DAY_SPEECHES);
+    // A SPEECH_TURN timer should now be armed for the first speaker.
+    assert.strictEqual(setup.room.engine.getCurrentSpeaker(), setup.guests[1].sessionId);
+    const snap = setup.room.engine.getPhaseTimer();
+    assert.ok(snap);
+    assert.strictEqual(snap!.mode, "SPEECH_TURN");
   });
 
   it("Day 3 first speaker is the seat immediately clockwise from Day 2's first speaker", async () => {
@@ -1698,15 +1707,21 @@ describe("mafia_room", () => {
     );
     await driveNight2WithSave(setup);
 
-    // Day 2 first speaker must be guests[1] (one seat clockwise from guests[0]).
+    // Day 2 first speaker must be guests[1] (one seat clockwise from
+    // guests[0]). The day opens with BALAGAN (ADR 0007); skip it to open
+    // the speech round.
     setup.host.send("startSpeeches");
     await setup.room.waitForNextPatch();
     assert.strictEqual(setup.room.state.dayCount, 2);
+    assert.strictEqual(setup.room.state.phase, GamePhase.DAY_BALAGAN);
+    setup.host.send("skipPhase");
+    await setup.room.waitForNextPatch();
+    assert.strictEqual(setup.room.state.phase, GamePhase.DAY_SPEECHES);
     assert.strictEqual(setup.room.engine.getCurrentSpeaker(), setup.guests[1].sessionId);
 
     // Drive Day 2 end-to-end so the next startSpeeches lands on Day 3.
     // First speaker nominates (fulfils the rule), then we drive through
-    // speeches в†’ BALAGAN в†’ DEFENSE в†’ VOTING в†’ NIGHT (dayCount = 2).
+    // BALAGAN (skipped) → SPEECHES → DEFENSE → VOTING → NIGHT (dayCount = 2).
     setup.guests[1].send("nominate", { targetId: setup.guests[8].sessionId });
     await setup.room.waitForNextPatch();
 
@@ -1715,10 +1730,7 @@ describe("mafia_room", () => {
       setup.host.send("nextSpeaker");
       await setup.room.waitForNextPatch();
     }
-    assert.strictEqual(setup.room.state.phase, GamePhase.DAY_BALAGAN);
-
-    setup.host.send("skipPhase");
-    await setup.room.waitForNextPatch();
+    // The last speech advances directly to defense on every day (ADR 0007).
     assert.strictEqual(setup.room.state.phase, GamePhase.DAY_DEFENSE);
 
     const dOrder = setup.room.engine.getDefenseOrder();
@@ -1737,7 +1749,7 @@ describe("mafia_room", () => {
     assert.strictEqual(setup.room.state.phase, GamePhase.NIGHT);
     assert.strictEqual(setup.room.state.dayCount, 2);
 
-    // Night 3 вЂ” a save keeps everyone alive for the rotation test.
+    // Night 3 — a save keeps everyone alive for the rotation test.
     setup.host.send("mafiaKill", { targetId: setup.guests[7].sessionId });
     await setup.room.waitForNextPatch();
     setup.guests[3].send("doctorHeal", { targetId: setup.guests[7].sessionId });
@@ -1747,9 +1759,16 @@ describe("mafia_room", () => {
     assert.strictEqual(setup.room.state.phase, GamePhase.DAY_ANNOUNCEMENT);
     assert.strictEqual(setup.room.state.dayCount, 3);
 
-    // Day 3 first speaker must be guests[2] вЂ” one seat after Day 2's guests[1].
+    // Day 3 first speaker must be guests[2] — one seat after Day 2's guests[1].
+    // Day 3 opens with BALAGAN (ADR 0007); skip it to open the speech round
+    // and freeze the roster so getCurrentSpeaker / getSpeakingOrder reflect
+    // the actual opener.
     setup.host.send("startSpeeches");
     await setup.room.waitForNextPatch();
+    assert.strictEqual(setup.room.state.phase, GamePhase.DAY_BALAGAN);
+    setup.host.send("skipPhase");
+    await setup.room.waitForNextPatch();
+    assert.strictEqual(setup.room.state.phase, GamePhase.DAY_SPEECHES);
     assert.strictEqual(setup.room.engine.getCurrentSpeaker(), setup.guests[2].sessionId);
     assert.strictEqual(setup.room.engine.getSpeakingOrder()[0], setup.guests[2].sessionId);
   });
@@ -1763,9 +1782,14 @@ describe("mafia_room", () => {
     );
     await driveNight2WithSave(setup);
 
-    // Day 2 вЂ” first speaker (guests[1]) nominates, fulfilling the rule.
+    // Day 2 — the day opens with BALAGAN (ADR 0007); skip it so the first
+    // speaker (guests[1]) can nominate, fulfilling the rule.
     setup.host.send("startSpeeches");
     await setup.room.waitForNextPatch();
+    assert.strictEqual(setup.room.state.phase, GamePhase.DAY_BALAGAN);
+    setup.host.send("skipPhase");
+    await setup.room.waitForNextPatch();
+    assert.strictEqual(setup.room.state.phase, GamePhase.DAY_SPEECHES);
     setup.guests[1].send("nominate", { targetId: setup.guests[8].sessionId });
     await setup.room.waitForNextPatch();
 
@@ -1774,8 +1798,8 @@ describe("mafia_room", () => {
       setup.host.send("nextSpeaker");
       await setup.room.waitForNextPatch();
     }
-    setup.host.send("skipPhase");
-    await setup.room.waitForNextPatch();
+    // The last speech advances directly to defense on every day (ADR 0007).
+    assert.strictEqual(setup.room.state.phase, GamePhase.DAY_DEFENSE);
     const dOrder = setup.room.engine.getDefenseOrder();
     for (let i = 0; i < dOrder.length; i++) {
       setup.host.send("nextDefense");
@@ -1788,7 +1812,7 @@ describe("mafia_room", () => {
     setup.host.send("resolveVoting");
     await setup.room.waitForNextPatch();
 
-    // Night 3 в†’ Day 3 (dayCount = 3).
+    // Night 3 → Day 3 (dayCount = 3).
     setup.host.send("mafiaKill", { targetId: setup.guests[7].sessionId });
     await setup.room.waitForNextPatch();
     setup.guests[3].send("doctorHeal", { targetId: setup.guests[7].sessionId });
@@ -1796,11 +1820,15 @@ describe("mafia_room", () => {
     setup.host.send("resolveNight");
     await setup.room.waitForNextPatch();
 
+    // Day 3 also opens with BALAGAN; skip it to open the speech round.
     setup.host.send("startSpeeches");
+    await setup.room.waitForNextPatch();
+    assert.strictEqual(setup.room.state.phase, GamePhase.DAY_BALAGAN);
+    setup.host.send("skipPhase");
     await setup.room.waitForNextPatch();
     assert.strictEqual(setup.room.engine.getCurrentSpeaker(), setup.guests[2].sessionId);
 
-    // Day 3 first speaker (guests[2]) must nominate afresh вЂ” Day 2's
+    // Day 3 first speaker (guests[2]) must nominate afresh — Day 2's
     // flag flip must not carry over. Without a nomination here, the host's
     // nextSpeaker should be rejected.
     const errors: string[] = [];
@@ -1812,7 +1840,7 @@ describe("mafia_room", () => {
     assert.strictEqual(
       errors.length,
       1,
-      "Day 3 first speaker must also nominate вЂ” Day 2's flag must not bleed",
+      "Day 3 first speaker must also nominate — Day 2's flag must not bleed",
     );
     assert.strictEqual(
       errors[0],
@@ -1821,7 +1849,7 @@ describe("mafia_room", () => {
     assert.strictEqual(setup.room.state.phase, GamePhase.DAY_SPEECHES);
   });
 
-  it("nominate during DAY_BALAGAN is accepted (a Day 2 first-word failure can still be cured before defense)", async () => {
+  it("nominate during DAY_BALAGAN is rejected (ADR 0007 — nominations are speech-phase only)", async () => {
     const setup = await setupRoom(colyseus, 10);
     await driveFullDay1(
       setup,
@@ -1832,29 +1860,10 @@ describe("mafia_room", () => {
 
     setup.host.send("startSpeeches");
     await setup.room.waitForNextPatch();
-    // First speaker (guests[1]) intentionally does NOT nominate.
-    // Drive all the way through speeches в†’ BALAGAN. The first-word rule
-    // permits advancing because guests[1] is NOT the first speaker вЂ” wait,
-    // actually guests[1] IS the Day 2 first speaker, so nextSpeaker on index
-    // 0 should reject. We need a different shape for this test: have a
-    // DIFFERENT player (e.g. guests[3]) be the first speaker, or have the
-    // first speaker (guests[1]) nominate.
-    //
-    // Re-shape: have guests[1] (Day 2 first speaker) satisfy the rule with a
-    // nomination, drive into BALAGAN, then have a non-first player nominate
-    // a SECOND candidate during BALAGAN.
-    setup.guests[1].send("nominate", { targetId: setup.guests[8].sessionId });
-    await setup.room.waitForNextPatch();
-
-    const order = setup.room.engine.getSpeakingOrder();
-    for (let i = 0; i < order.length; i++) {
-      setup.host.send("nextSpeaker");
-      await setup.room.waitForNextPatch();
-    }
     assert.strictEqual(setup.room.state.phase, GamePhase.DAY_BALAGAN);
-    assert.strictEqual(setup.room.state.nominations.length, 1);
+    assert.strictEqual(setup.room.state.nominations.length, 0, "the day is fresh — no nominations yet");
 
-    // During BALAGAN, a second late nomination from any player is accepted.
+    // During the debate, a nomination from any player is rejected.
     const errors: string[] = [];
     setup.guests[3].onMessage("error", (msg: unknown) => {
       errors.push(String((msg as { message?: string }).message ?? msg));
@@ -1862,9 +1871,72 @@ describe("mafia_room", () => {
     setup.guests[3].send("nominate", { targetId: setup.guests[7].sessionId });
     await setup.room.waitForNextPatch();
 
-    assert.strictEqual(errors.length, 0, "nominate during DAY_BALAGAN is allowed");
-    assert.strictEqual(setup.room.state.nominations.length, 2);
+    assert.strictEqual(errors.length, 1, "nominate during DAY_BALAGAN must be rejected");
+    assert.strictEqual(
+      errors[0],
+      "\u0417\u0430\u0440\u0430\u0437 \u043d\u0435 \u0442\u0430 \u0444\u0430\u0437\u0430 \u0434\u043b\u044f \u0446\u0456\u0454\u0457 \u0434\u0456\u0457",
+      "WRONG_PHASE surfaces as the Ukrainian phase-mismatch message",
+    );
+    assert.strictEqual(setup.room.state.nominations.length, 0, "no nomination recorded");
     assert.strictEqual(setup.room.state.phase, GamePhase.DAY_BALAGAN);
+  });
+
+  it("declareDead during DAY_BALAGAN: the roster freezes without the declared-dead player (ADR 0007 late freeze)", async () => {
+    const setup = await setupRoom(colyseus, 10);
+    await driveFullDay1(
+      setup,
+      (day1Nominee(setup)),
+      (day1Sacrifice(setup)),
+    );
+    await driveNight2WithSave(setup);
+
+    // Day 2 opens with the debate.
+    setup.host.send("startSpeeches");
+    await setup.room.waitForNextPatch();
+    assert.strictEqual(setup.room.state.phase, GamePhase.DAY_BALAGAN);
+    assert.deepStrictEqual(setup.room.engine.getSpeakingOrder(), [], "roster not frozen yet");
+
+    // guests[1] — the seat that would open the speeches — drops mid-debate.
+    // The drop pauses the BALAGAN timer (ticket 05).
+    const droppedId = setup.guests[1].sessionId;
+    (setup.room as unknown as { _simulateDropForTest(s: string): void })._simulateDropForTest(
+      droppedId,
+    );
+    await setup.room.waitForNextPatch();
+    assert.strictEqual(setup.room.engine.getPhaseTimer()!.paused, true, "BALAGAN timer paused for the drop");
+
+    // The host declares them dead; the pause clears.
+    setup.host.send("declareDead", { sessionId: droppedId });
+    await setup.room.waitForNextPatch();
+    assert.strictEqual(setup.room.state.players.get(droppedId)!.isAlive, false);
+
+    // Skipping the debate opens the speech round — the roster freezes now,
+    // excluding the declared-dead player. The first alive seat clockwise
+    // from the anchor (guests[2]) opens the day and carries the first-word
+    // duty.
+    setup.host.send("skipPhase");
+    await setup.room.waitForNextPatch();
+    assert.strictEqual(setup.room.state.phase, GamePhase.DAY_SPEECHES);
+    const order = setup.room.engine.getSpeakingOrder();
+    assert.ok(!order.includes(droppedId), "declared-dead player must not be in the roster");
+    assert.strictEqual(order[0], setup.guests[2].sessionId);
+    assert.strictEqual(setup.room.engine.getCurrentSpeaker(), setup.guests[2].sessionId);
+
+    // The first-word duty binds to the actual opener: ending their speech
+    // without a nomination is rejected.
+    const errors: string[] = [];
+    setup.host.onMessage("error", (msg: unknown) => {
+      errors.push(String((msg as { message?: string }).message ?? msg));
+    });
+    setup.host.send("nextSpeaker");
+    await setup.room.waitForNextPatch();
+    assert.strictEqual(errors.length, 1, "the actual opener must nominate first");
+    assert.strictEqual(
+      errors[0],
+      "\u0417\u0430\u0440\u0430\u0437 \u043d\u0435 \u0442\u0430 \u0444\u0430\u0437\u0430 \u0434\u043b\u044f \u0446\u0456\u0454\u0457 \u0434\u0456\u0457",
+    );
+    assert.strictEqual(setup.room.state.phase, GamePhase.DAY_SPEECHES);
+    assert.strictEqual(setup.room.engine.getCurrentSpeaker(), setup.guests[2].sessionId);
   });
 
   // ─── Ticket 07b: private check delivery ─────────────────────────────
@@ -2328,8 +2400,14 @@ describe("mafia_room", () => {
 
     // Day 2: guests[1] (the last black) is the first speaker; the
     // first-word rule forces a nomination — they nominate themselves.
+    // The day opens with BALAGAN (ADR 0007); skip it to open the speech
+    // round and freeze the roster.
     host.send("startSpeeches");
     await room.waitForNextPatch();
+    assert.strictEqual(room.state.phase, GamePhase.DAY_BALAGAN);
+    host.send("skipPhase");
+    await room.waitForNextPatch();
+    assert.strictEqual(room.state.phase, GamePhase.DAY_SPEECHES);
     assert.strictEqual(room.engine.getCurrentSpeaker(), guests[1].sessionId);
     guests[1].send("nominate", { targetId: guests[1].sessionId });
     await room.waitForNextPatch();
@@ -2339,9 +2417,8 @@ describe("mafia_room", () => {
       host.send("nextSpeaker");
       await room.waitForNextPatch();
     }
-    assert.strictEqual(room.state.phase, GamePhase.DAY_BALAGAN);
-    host.send("skipPhase");
-    await room.waitForNextPatch();
+    // The last speech advances directly to defense on every day (ADR 0007).
+    assert.strictEqual(room.state.phase, GamePhase.DAY_DEFENSE);
     const dOrder2 = room.engine.getDefenseOrder();
     for (let i = 0; i < dOrder2.length; i++) {
       host.send("nextDefense");

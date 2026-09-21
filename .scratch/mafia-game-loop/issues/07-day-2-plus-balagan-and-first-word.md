@@ -79,3 +79,9 @@ No code changes were needed. The existing `nextSpeaker`, `nominate`, and `skipPh
 
 - `npx tsc -p tsconfig.build.json --noEmit` — clean.
 - `npm test` — **207 passing**, 0 failing (was 183 before ticket 07; +24 new tests: 17 engine + 7 mafia-room integration).
+
+---
+
+## Revision 2026-09-20 — BALAGAN moved before speeches (ADR 0007)
+
+The Day 2+ sequence is now `ANNOUNCEMENT → BALAGAN → SPEECHES → DEFENSE → VOTING`; the work recorded above placed BALAGAN between speeches and defense. The first-word rule, the rotation anchor, and the Day-1 exclusion are unchanged. The speculative `nominate`-during-BALAGAN acceptance was closed (nominations are valid in `DAY_SPEECHES` only). Tests were re-pointed per `.scratch/balagan-reorder/spec.md`. This note appends; the completed work above is not rewritten.

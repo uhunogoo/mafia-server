@@ -22,8 +22,8 @@ The game is a cycle. `LOBBY` precedes the cycle; `GAME_OVER` terminates it.
 - **LOBBY** — players join, host configures.
 - **NIGHT** — silent actions in fixed order: Mafia → Don → Sheriff → Doctor. Ends when all living role-bearers have acted or the night window closes.
 - **DAY_ANNOUNCEMENT** — host announces who died (or no one).
+- **DAY_BALAGAN** — open debate (1–2 min). Present only from Day 2 onward (see ADR 0005); on Day 2+ it runs after the announcement and before speeches (see ADR 0007).
 - **DAY_SPEECHES** — clockwise speeches (1 min each). Day ≥2: first speaker must nominate.
-- **DAY_BALAGAN** — open debate (1–2 min). Present only from Day 2 onward (see ADR 0005).
 - **DAY_DEFENSE** — each nominated candidate defends (30 sec).
 - **DAY_VOTING** — simultaneous vote for candidates (no abstention; default vote = last speaker if no input).
 - **GAME_OVER** — terminal; final roles revealed.

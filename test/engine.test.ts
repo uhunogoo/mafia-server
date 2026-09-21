@@ -8,7 +8,7 @@ import { EngineErrorCode, type DeathCause, type GameOverResult } from "../src/ga
 /**
  * Helper: build a fresh MafiaState populated with `count` non-host players
  * (plus an optional host) and return both. Players are keyed by deterministic
- * sessionIds "p0"вЂ¦"pN-1" so tests can target them directly.
+ * sessionIds "p0"…"pN-1" so tests can target them directly.
  */
 function freshState(count: number, withHost = true): MafiaState {
   const state = new MafiaState();
@@ -33,7 +33,7 @@ function freshState(count: number, withHost = true): MafiaState {
   return state;
 }
 
-describe("Engine вЂ” role assignment", () => {
+describe("Engine — role assignment", () => {
   for (const count of [9, 10, 11] as const) {
     it(`assigns the right distribution for ${count} players`, () => {
       const state = freshState(count);
@@ -109,11 +109,11 @@ describe("Engine вЂ” role assignment", () => {
   });
 });
 
-describe("Engine вЂ” public schema secrecy", () => {
+describe("Engine — public schema secrecy", () => {
   it("Player schema has no role/team fields", () => {
     const p = new Player();
     // Public Player exposes: sessionId, seatIndex, name, isAlive, isHost,
-    // isNominated, votes вЂ” and crucially NOT role/team.
+    // isNominated, votes — and crucially NOT role/team.
     assert.strictEqual((p as unknown as { role?: unknown }).role, undefined);
     assert.strictEqual((p as unknown as { team?: unknown }).team, undefined);
   });
@@ -130,7 +130,7 @@ describe("Engine вЂ” public schema secrecy", () => {
   });
 });
 
-describe("Engine вЂ” night actions", () => {
+describe("Engine — night actions", () => {
   function startAndAssign(engine: Engine) {
     engine.startGame();
     // Inject deterministic roles so tests can target specific actors.
@@ -231,7 +231,7 @@ describe("Engine вЂ” night actions", () => {
   });
 });
 
-describe("Engine вЂ” phase guards", () => {
+describe("Engine — phase guards", () => {
   function startEngine10(): { state: MafiaState; engine: Engine } {
     const state = freshState(10);
     const engine = new Engine(state);
@@ -270,7 +270,7 @@ describe("Engine вЂ” phase guards", () => {
   });
 });
 
-describe("Engine вЂ” night resolution", () => {
+describe("Engine — night resolution", () => {
   function setup10(): { state: MafiaState; engine: Engine } {
     const state = freshState(10);
     const engine = new Engine(state);
@@ -279,7 +279,7 @@ describe("Engine вЂ” night resolution", () => {
     return { state, engine };
   }
 
-  it("doctor matches mafia victim в†’ state.died is empty", () => {
+  it("doctor matches mafia victim → state.died is empty", () => {
     const { state, engine } = setup10();
     engine.mafiaKill("host", "p4");
     engine.doctorHeal("p3", "p4");
@@ -291,7 +291,7 @@ describe("Engine вЂ” night resolution", () => {
     assert.strictEqual(state.died, "");
   });
 
-  it("doctor does not match mafia victim в†’ state.died equals the victim", () => {
+  it("doctor does not match mafia victim → state.died equals the victim", () => {
     const { state, engine } = setup10();
     engine.mafiaKill("host", "p4");
     // Doctor heals someone else.
@@ -302,7 +302,7 @@ describe("Engine вЂ” night resolution", () => {
     assert.strictEqual(state.died, "p4");
   });
 
-  it("no mafia victim submitted в†’ state.died stays empty", () => {
+  it("no mafia victim submitted → state.died stays empty", () => {
     const { state, engine } = setup10();
     engine.doctorHeal("p3", "p5");
     const res = engine.resolveNight();
@@ -352,7 +352,7 @@ describe("Engine вЂ” night resolution", () => {
   });
 });
 
-describe("Engine вЂ” action log", () => {
+describe("Engine — action log", () => {
   it("records every accepted action and the phase events", () => {
     const state = freshState(10);
     const engine = new Engine(state);
@@ -1382,12 +1382,13 @@ describe("Engine — voting ties + revote (ticket 08)", () => {
       engine.resolveTieByPardon("host");
 
       // Walk day 2 back into DAY_VOTING: kill p4 (the doctor must pick a
-      // different target this time), then speeches → BALAGAN (day 2+) →
-      // defense → voting.
+      // different target this time), then BALAGAN → speeches → defense →
+      // voting (ADR 0007 order).
       engine.mafiaKill("host", "p4");
       engine.doctorHeal("p3", "p5");
       engine.resolveNight();
       engine.startSpeeches();
+      engine.skipPhase("host"); // ADR 0007: skip the debate to open speeches
       // Day 2's first speaker is p1 (the seat after day 1's p0); the
       // first-word rule requires them to nominate.
       engine.nominate("p1", "p6");
@@ -1395,8 +1396,8 @@ describe("Engine — voting ties + revote (ticket 08)", () => {
       engine.nominate("p1", "p8");
       const order = engine.getSpeakingOrder();
       for (let i = 0; i < order.length; i++) engine.nextSpeaker();
-      assert.strictEqual(engine.state.phase, GamePhase.DAY_BALAGAN);
-      engine.skipPhase("host"); // end the debate early → DAY_DEFENSE
+      // The last speech advances directly to defense on every day (ADR 0007).
+      assert.strictEqual(engine.state.phase, GamePhase.DAY_DEFENSE);
       const dOrder = engine.getDefenseOrder();
       for (let i = 0; i < dOrder.length; i++) engine.nextDefense();
       assert.strictEqual(engine.state.phase, GamePhase.DAY_VOTING);
@@ -2396,7 +2397,20 @@ describe("Engine — Day 2+ BALAGAN + first-word rule (ticket 07)", () => {
     const state = freshState(10);
     const engine = new Engine(state);
     engine.startGame();
+    // ADR 0007 / ticket 02: pin ALL 10 roles deterministically so the
+    // late-freeze tests can kick or vote out p0/p1/p6 mid-BALAGAN or mid-day
+    // without triggering a victory check. Only p7/p8/p9 are BLACK; the
+    // rest are RED. p3 is the DOCTOR (the doctor heal is exercised below).
+    engine._assignRoleForTest("p0", Role.CIVILIAN);
+    engine._assignRoleForTest("p1", Role.CIVILIAN);
+    engine._assignRoleForTest("p2", Role.SHERIFF);
     engine._assignRoleForTest("p3", Role.DOCTOR);
+    engine._assignRoleForTest("p4", Role.CIVILIAN);
+    engine._assignRoleForTest("p5", Role.CIVILIAN);
+    engine._assignRoleForTest("p6", Role.CIVILIAN);
+    engine._assignRoleForTest("p7", Role.DON);
+    engine._assignRoleForTest("p8", Role.MAFIA);
+    engine._assignRoleForTest("p9", Role.MAFIA);
     // Mafia kills p4; Doctor saves p4 so all 10 players remain alive for the
     // speaking-order / first-word rotation tests.
     engine.mafiaKill("host", "p4");
@@ -2432,20 +2446,30 @@ describe("Engine — Day 2+ BALAGAN + first-word rule (ticket 07)", () => {
   }
 
   /**
-   * Drive the engine all the way through Day 2 (speeches, BALAGAN, defense,
-   * voting) so the next `startSpeeches` lands on Day 3. The first-word rule
-   * is satisfied (first speaker nominates), and BALAGAN is skipped with
-   * `skipPhase` to avoid driving the clock.
+   * Drive the engine all the way through Day 2 (BALAGAN → SPEECHES → DEFENSE
+   * → VOTING → resolveVoting) so the next `startSpeeches` lands on Day 3.
+   * The first-word rule is satisfied (first speaker nominates), BALAGAN is
+   * skipped with `skipPhase` to avoid driving the clock, and resolveVoting
+   * ends the day.
+   *
+   * Note: the resolved elimination target is the implicit last speaker
+   * (p0, the seat that wraps around the rotation), NOT the nominated p6
+   * — all default votes go to the last speaker, who isn't on the
+   * nomination list. p6 stays alive, p0 dies. With deterministic roles
+   * (p0 = CIVILIAN, p7/p8/p9 = BLACK), the vote does not trigger victory.
    */
   function driveDay2(engine: Engine): void {
+    // ADR 0007: on Day 2+ startSpeeches opens BALAGAN; skipping it opens the
+    // speech round and freezes the roster.
     engine.startSpeeches();
+    engine.skipPhase("host");
     engine.nominate("p1", "p6");
     const order = engine.getSpeakingOrder();
     for (let i = 0; i < order.length; i++) {
       engine.nextSpeaker();
     }
-    // Day 2 ends the last speech in DAY_BALAGAN — skip past it for the test.
-    engine.skipPhase("host");
+    // The last speech advances directly to DAY_DEFENSE on every day
+    // (ADR 0007 — BALAGAN precedes speeches, so last speech → DEFENSE).
     const dOrder = engine.getDefenseOrder();
     for (let i = 0; i < dOrder.length; i++) {
       engine.nextDefense();
@@ -2471,7 +2495,10 @@ describe("Engine — Day 2+ BALAGAN + first-word rule (ticket 07)", () => {
     it("Day 2 first speaker is the seat immediately clockwise from Day 1's first speaker", () => {
       const engine = driveDay1();
       driveNight2(engine);
+      // ADR 0007: startSpeeches opens BALAGAN on Day 2+; skipping it opens
+      // the speech round and freezes the roster.
       engine.startSpeeches();
+      engine.skipPhase("host");
       assert.strictEqual(engine.getCurrentSpeaker(), "p1");
       assert.deepStrictEqual(engine.getSpeakingOrder()[0], "p1");
     });
@@ -2480,12 +2507,15 @@ describe("Engine — Day 2+ BALAGAN + first-word rule (ticket 07)", () => {
       const engine = driveDay1();
       driveNight2(engine);
       driveDay2(engine);
-      // After Day 2 voting, we're in NIGHT with dayCount = 2. Drive Night 3.
+      // driveDay2 stops at DAY_VOTING with all 10 players still alive (p6
+      // is nominated but the vote isn't resolved). Drive Night 3: mafia
+      // tries to kill p6, doctor saves.
       engine.mafiaKill("host", "p6");
       engine.doctorHeal("p3", "p6");
       engine.resolveNight();
       // Now: DAY_ANNOUNCEMENT, dayCount = 3.
       engine.startSpeeches();
+      engine.skipPhase("host");
       assert.strictEqual(engine.getCurrentSpeaker(), "p2");
       assert.deepStrictEqual(engine.getSpeakingOrder()[0], "p2");
     });
@@ -2509,6 +2539,7 @@ describe("Engine — Day 2+ BALAGAN + first-word rule (ticket 07)", () => {
       engine._setFirstSpeakerIdForTest("p9");
 
       engine.startSpeeches();
+      engine.skipPhase("host");
       // Day 4's first speaker must wrap from p9 (seat 9, the highest) to
       // the lowest seat alive — p0.
       assert.strictEqual(engine.getCurrentSpeaker(), "p0");
@@ -2537,6 +2568,7 @@ describe("Engine — Day 2+ BALAGAN + first-word rule (ticket 07)", () => {
       const engine = driveDay1();
       driveNight2(engine);
       engine.startSpeeches();
+      engine.skipPhase("host"); // ADR 0007: skip the debate to open speeches
       // First speaker is p1; they have not nominated. nextSpeaker rejects.
       assert.strictEqual(engine.getCurrentSpeaker(), "p1");
       assert.throws(
@@ -2552,6 +2584,7 @@ describe("Engine — Day 2+ BALAGAN + first-word rule (ticket 07)", () => {
       const engine = driveDay1();
       driveNight2(engine);
       engine.startSpeeches();
+      engine.skipPhase("host"); // ADR 0007: skip the debate to open speeches
       engine.nominate("p1", "p1"); // self-nomination is allowed
       // nextSpeaker should now succeed.
       engine.nextSpeaker();
@@ -2563,6 +2596,7 @@ describe("Engine — Day 2+ BALAGAN + first-word rule (ticket 07)", () => {
       const engine = driveDay1();
       driveNight2(engine);
       engine.startSpeeches();
+      engine.skipPhase("host"); // ADR 0007: skip the debate to open speeches
       engine.nominate("p1", "p6");
       engine.nextSpeaker();
       assert.strictEqual(engine.state.phase, GamePhase.DAY_SPEECHES);
@@ -2579,6 +2613,7 @@ describe("Engine — Day 2+ BALAGAN + first-word rule (ticket 07)", () => {
       engine.resolveNight();
       // Day 3 starts. firstSpeakerId was p1; rotation puts p2 first.
       engine.startSpeeches();
+      engine.skipPhase("host");
       assert.strictEqual(engine.getCurrentSpeaker(), "p2");
       // p2 has not nominated yet. Without a nomination, nextSpeaker must
       // reject — confirms the flag was reset (not carried over from Day 2
@@ -2593,6 +2628,7 @@ describe("Engine — Day 2+ BALAGAN + first-word rule (ticket 07)", () => {
       const engine = driveDay1();
       driveNight2(engine);
       engine.startSpeeches();
+      engine.skipPhase("host"); // ADR 0007: skip the debate to open speeches
       engine.nominate("p1", "p6");
       engine.nextSpeaker();
       // p2 (second speaker) has not nominated. nextSpeaker should still
@@ -2606,6 +2642,7 @@ describe("Engine — Day 2+ BALAGAN + first-word rule (ticket 07)", () => {
       const engine = driveDay1();
       driveNight2(engine);
       engine.startSpeeches();
+      engine.skipPhase("host"); // ADR 0007: skip the debate to open speeches
       // p2 (NOT the first speaker) nominates first.
       engine.nominate("p2", "p7");
       // The first speaker (p1) still has not nominated, so nextSpeaker must
@@ -2617,26 +2654,24 @@ describe("Engine — Day 2+ BALAGAN + first-word rule (ticket 07)", () => {
     });
   });
 
-  describe("Day 2+ phase sequence (BALAGAN between speeches and defense)", () => {
-    it("Day 2 final nextSpeaker auto-transitions to DAY_BALAGAN (not DAY_DEFENSE)", () => {
+  describe("Day 2+ phase sequence (BALAGAN precedes speeches)", () => {
+    it("Day 2 startSpeeches enters DAY_BALAGAN (not DAY_SPEECHES)", () => {
       const engine = driveDay1();
       driveNight2(engine);
+      // ADR 0007: on Day 2+ the host's start-speeches press opens BALAGAN —
+      // the free debate runs before any speech.
       engine.startSpeeches();
-      engine.nominate("p1", "p6");
-      const order = engine.getSpeakingOrder();
-      for (let i = 0; i < order.length; i++) {
-        engine.nextSpeaker();
-      }
-      // After the last speech on Day 2+, we should land in DAY_BALAGAN.
       assert.strictEqual(engine.state.phase, GamePhase.DAY_BALAGAN);
       // And a 90s BALAGAN timer should be armed.
       const snap = engine.getPhaseTimer();
       assert.ok(snap, "BALAGAN timer should be armed");
       assert.strictEqual(snap!.mode, "BALAGAN");
       assert.strictEqual(snap!.durationMs, 90_000);
+      // The roster freezes when speeches begin, not when the day opens.
+      assert.deepStrictEqual(engine.getSpeakingOrder(), []);
     });
 
-    it("BALAGAN timer expiry auto-transitions to DAY_DEFENSE", () => {
+    it("BALAGAN timer expiry auto-transitions to DAY_SPEECHES and freezes the roster", () => {
       const engine = driveDay1();
       driveNight2(engine);
       // Inject fake clock BEFORE startSpeeches so the BALAGAN timer is
@@ -2644,11 +2679,6 @@ describe("Engine — Day 2+ BALAGAN + first-word rule (ticket 07)", () => {
       const now = { value: 0 };
       engine._setClockForTest(() => now.value);
       engine.startSpeeches();
-      engine.nominate("p1", "p6");
-      const order = engine.getSpeakingOrder();
-      for (let i = 0; i < order.length; i++) {
-        engine.nextSpeaker();
-      }
       assert.strictEqual(engine.state.phase, GamePhase.DAY_BALAGAN);
 
       // Jump to t=91s — past the 90s BALAGAN window.
@@ -2659,27 +2689,28 @@ describe("Engine — Day 2+ BALAGAN + first-word rule (ticket 07)", () => {
         events.some((e) => e.type === "EXPIRED" && e.mode === "BALAGAN"),
         "EXPIRED BALAGAN event should fire",
       );
-      // Engine should have auto-transitioned to DAY_DEFENSE.
-      assert.strictEqual(engine.state.phase, GamePhase.DAY_DEFENSE);
+      // The debate flows into the speech round; the roster freezes now.
+      assert.strictEqual(engine.state.phase, GamePhase.DAY_SPEECHES);
+      assert.strictEqual(engine.getSpeakingOrder()[0], "p1");
+      assert.strictEqual(engine.getCurrentSpeaker(), "p1");
+      const snap = engine.getPhaseTimer();
+      assert.ok(snap, "SPEECH_TURN timer should be armed");
+      assert.strictEqual(snap!.mode, "SPEECH_TURN");
     });
 
-    it("host skipPhase during BALAGAN advances to DAY_DEFENSE", () => {
+    it("host skipPhase during BALAGAN advances to DAY_SPEECHES", () => {
       const engine = driveDay1();
       driveNight2(engine);
       engine.startSpeeches();
-      engine.nominate("p1", "p6");
-      const order = engine.getSpeakingOrder();
-      for (let i = 0; i < order.length; i++) {
-        engine.nextSpeaker();
-      }
       assert.strictEqual(engine.state.phase, GamePhase.DAY_BALAGAN);
 
       engine.skipPhase("host");
-      assert.strictEqual(engine.state.phase, GamePhase.DAY_DEFENSE);
-      // A DEFENSE_TURN timer should now be armed.
+      assert.strictEqual(engine.state.phase, GamePhase.DAY_SPEECHES);
+      assert.strictEqual(engine.getCurrentSpeaker(), "p1");
+      // A SPEECH_TURN timer should now be armed.
       const snap = engine.getPhaseTimer();
       assert.ok(snap);
-      assert.strictEqual(snap!.mode, "DEFENSE_TURN");
+      assert.strictEqual(snap!.mode, "SPEECH_TURN");
     });
 
     it("Day 1 still skips BALAGAN: final nextSpeaker auto-transitions directly to DAY_DEFENSE", () => {
@@ -2703,34 +2734,45 @@ describe("Engine — Day 2+ BALAGAN + first-word rule (ticket 07)", () => {
       assert.strictEqual(engine.state.phase, GamePhase.DAY_DEFENSE);
     });
 
-    it("nominate is still allowed during DAY_BALAGAN (existing phase guard)", () => {
+    it("nominate is rejected during DAY_BALAGAN (ADR 0007 — speeches only)", () => {
       const engine = driveDay1();
       driveNight2(engine);
       engine.startSpeeches();
-      engine.nominate("p1", "p6");
-      const order = engine.getSpeakingOrder();
-      for (let i = 0; i < order.length; i++) {
-        engine.nextSpeaker();
-      }
       assert.strictEqual(engine.state.phase, GamePhase.DAY_BALAGAN);
-      // Any alive player can still add nominations during BALAGAN.
-      engine.nominate("p3", "p8");
-      assert.deepStrictEqual([...engine.state.nominations], ["p6", "p8"]);
+      // Nominations are valid during DAY_SPEECHES only, on all days.
+      assert.throws(
+        () => engine.nominate("p3", "p8"),
+        (err: unknown) => {
+          const e = err as { code: string; message: string };
+          return (
+            e.code === EngineErrorCode.WRONG_PHASE &&
+            e.message.includes("nominate requires phase DAY_SPEECHES") &&
+            !e.message.includes("or DAY_BALAGAN")
+          );
+        },
+      );
+      // State is unchanged.
+      assert.deepStrictEqual([...engine.state.nominations], []);
+      assert.strictEqual(engine.state.phase, GamePhase.DAY_BALAGAN);
     });
 
-    it("a full Day 2 cycle ends in NIGHT (BALAGAN → DEFENSE → VOTING → NIGHT)", () => {
+    it("a full Day 2 cycle ends in NIGHT (BALAGAN → SPEECHES → DEFENSE → VOTING → NIGHT)", () => {
       const engine = driveDay1();
       driveNight2(engine);
+      // ADR 0007: the day opens with BALAGAN...
       engine.startSpeeches();
+      assert.strictEqual(engine.state.phase, GamePhase.DAY_BALAGAN);
+      // ...skipped manually so the test doesn't have to advance the clock —
+      // the skip opens the speech round.
+      engine.skipPhase("host");
+      assert.strictEqual(engine.state.phase, GamePhase.DAY_SPEECHES);
+      // The first speaker (p1) nominates, then the speeches run; the last
+      // speech advances directly to defense on every day.
       engine.nominate("p1", "p6");
       const order = engine.getSpeakingOrder();
       for (let i = 0; i < order.length; i++) {
         engine.nextSpeaker();
       }
-      // Day 2: should be in BALAGAN.
-      assert.strictEqual(engine.state.phase, GamePhase.DAY_BALAGAN);
-      // Skip BALAGAN manually so the test doesn't have to advance the clock.
-      engine.skipPhase("host");
       assert.strictEqual(engine.state.phase, GamePhase.DAY_DEFENSE);
       const dOrder = engine.getDefenseOrder();
       for (let i = 0; i < dOrder.length; i++) {
@@ -2740,6 +2782,96 @@ describe("Engine — Day 2+ BALAGAN + first-word rule (ticket 07)", () => {
       engine.resolveVoting();
       assert.strictEqual(engine.state.phase, GamePhase.NIGHT);
       assert.strictEqual(engine.state.dayCount, 2);
+    });
+
+    it("kick during BALAGAN leaves the speaking roster (late freeze) — opener death", () => {
+      const engine = driveDay1();
+      driveNight2(engine);
+      // The Day 2 opener would be p1 (the seat after Day 1's first speaker
+      // p0), but the roster is not frozen during BALAGAN.
+      engine.startSpeeches();
+      assert.strictEqual(engine.state.phase, GamePhase.DAY_BALAGAN);
+      assert.deepStrictEqual(engine.getSpeakingOrder(), []);
+
+      // p1 is kicked mid-debate — before the freeze.
+      engine.kick("host", "p1", "foul");
+      engine.skipPhase("host");
+
+      // The freeze happens now: p1 is off the roster and the first alive
+      // seat clockwise from the anchor (p2) opens the day.
+      assert.strictEqual(engine.state.phase, GamePhase.DAY_SPEECHES);
+      const order = engine.getSpeakingOrder();
+      assert.strictEqual(order[0], "p2");
+      assert.ok(!order.includes("p1"), "kicked player must not be in the roster");
+      assert.strictEqual(engine.getCurrentSpeaker(), "p2");
+
+      // The first-word duty binds to the actual opener: p2 cannot end their
+      // speech without nominating.
+      assert.throws(
+        () => engine.nextSpeaker(),
+        (err: unknown) => (err as { code: string }).code === EngineErrorCode.WRONG_PHASE,
+      );
+      engine.nominate("p2", "p6");
+      engine.nextSpeaker();
+      assert.strictEqual(engine.getCurrentSpeaker(), "p3");
+    });
+
+    it("kick during BALAGAN keeps the rotation anchored on the actual opener", () => {
+      const engine = driveDay1();
+      driveNight2(engine);
+      engine.startSpeeches();
+      assert.strictEqual(engine.state.phase, GamePhase.DAY_BALAGAN);
+
+      // The anchor-seat player (p0, Day 1's first speaker) is kicked
+      // mid-debate. The rotation anchors on p0's held seatIndex, so the
+      // opener is still p1 — and p1 becomes the recorded anchor at the
+      // freeze.
+      engine.kick("host", "p0", "foul");
+      engine.skipPhase("host");
+      assert.strictEqual(engine.state.phase, GamePhase.DAY_SPEECHES);
+      assert.strictEqual(engine.getSpeakingOrder()[0], "p1");
+      assert.strictEqual(engine.getCurrentSpeaker(), "p1");
+
+      // Drive Day 2: the opener nominates, the speeches run, the last speech
+      // advances to defense, and the default votes (last speaker) end the day.
+      engine.nominate("p1", "p6");
+      const order = engine.getSpeakingOrder();
+      for (let i = 0; i < order.length; i++) engine.nextSpeaker();
+      const dOrder = engine.getDefenseOrder();
+      for (let i = 0; i < dOrder.length; i++) engine.nextDefense();
+      engine.resolveVoting();
+      assert.strictEqual(engine.state.phase, GamePhase.NIGHT);
+
+      // Night 3 (a save) → Day 3.
+      engine.mafiaKill("host", "p7");
+      engine.doctorHeal("p3", "p7");
+      engine.resolveNight();
+
+      // Day 3's rotation anchors on p1 — Day 2's actual opener.
+      engine.startSpeeches();
+      engine.skipPhase("host");
+      assert.strictEqual(engine.getCurrentSpeaker(), "p2");
+      assert.deepStrictEqual(engine.getSpeakingOrder()[0], "p2");
+    });
+
+    it("declareDead during BALAGAN leaves the speaking roster (late freeze)", () => {
+      const engine = driveDay1();
+      driveNight2(engine);
+      engine.startSpeeches();
+      assert.strictEqual(engine.state.phase, GamePhase.DAY_BALAGAN);
+
+      // p2 drops mid-debate and the host declares them dead (ticket 05
+      // path: pauseForMissing → declareDead).
+      engine.pauseForMissing("p2");
+      engine.declareDead("host", "p2");
+      engine.skipPhase("host");
+
+      // The freeze computes the order without the declared-dead player.
+      assert.strictEqual(engine.state.phase, GamePhase.DAY_SPEECHES);
+      const order = engine.getSpeakingOrder();
+      assert.ok(!order.includes("p2"), "declared-dead player must not be in the roster");
+      assert.strictEqual(order[0], "p1");
+      assert.strictEqual(engine.getCurrentSpeaker(), "p1");
     });
   });
 });
@@ -3194,11 +3326,13 @@ describe("Engine — victory + reveal (ticket 09)", () => {
     // rule requires them to nominate — they nominate themselves. Everyone
     // alive votes p1, the last black.
     engine.startSpeeches();
+    assert.strictEqual(state.phase, GamePhase.DAY_BALAGAN, "day 2 opens BALAGAN (ADR 0007)");
+    engine.skipPhase("host"); // skip the debate → the speech round opens
     engine.nominate("p1", "p1");
     const order2 = engine.getSpeakingOrder();
     for (let i = 0; i < order2.length; i++) engine.nextSpeaker();
-    assert.strictEqual(state.phase, GamePhase.DAY_BALAGAN, "day 2 inserts BALAGAN");
-    engine.skipPhase("host");
+    // The last speech advances directly to defense on every day (ADR 0007).
+    assert.strictEqual(state.phase, GamePhase.DAY_DEFENSE);
     const dOrder2 = engine.getDefenseOrder();
     for (let i = 0; i < dOrder2.length; i++) engine.nextDefense();
     for (const id of order2) engine.vote(id, "p1");

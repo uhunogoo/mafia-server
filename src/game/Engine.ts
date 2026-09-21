@@ -101,8 +101,9 @@ function shuffle<T>(items: readonly T[]): T[] {
  *    non-host messages from dead players as the first line of defense)
  *
  * Slice-7 (ticket 07) adds Day 2+ BALAGAN + first-word rule:
- *  - on Day 2+ (`dayCount >= 2`), the day sequence inserts `DAY_BALAGAN`
- *    between speeches and defense; Day 1 still skips BALAGAN per ADR 0005
+ *  - on Day 2+ (`dayCount >= 2`), the day sequence runs `DAY_BALAGAN` between
+ *    the announcement and the speeches (ADR 0007 — moved from after speeches);
+ *    Day 1 still skips BALAGAN per ADR 0005
  *  - on Day 2+, the first speaker must nominate an elimination candidate
  *    during their speech; `nextSpeaker` rejects the call when they haven't
  *  - the first-word right shifts clockwise each day — the first speaker of
@@ -189,8 +190,11 @@ export class Engine {
 
   /**
    * Day-cycle speaking order — alive non-host players in seat order. Recomputed
-   * each day at `startSpeeches`; players who die during the day stay in this
-   * list (defensive — they should not be on it because we recompute at start).
+   * each day when speeches begin (`enterDaySpeeches` — after BALAGAN on Day 2+,
+   * ADR 0007): players who die during the day stay in this list (defensive —
+   * they should not be on it because we recompute at the freeze), while
+   * players who die during BALAGAN are excluded because the roster is computed
+   * after it.
    */
   private speakingOrder: string[] = [];
 
@@ -221,14 +225,16 @@ export class Engine {
   /**
    * SessionId of the previous day's first speaker. Used to rotate the Day 2+
    * speaking order so the first-word right shifts clockwise each day. Empty
-   * string before the first day; updated by `startSpeeches` after computing
-   * the new speaking order (ticket 07).
+   * string before the first day; updated by `enterDaySpeeches` after computing
+   * the new speaking order (ticket 07) — so the recorded anchor is the actual
+   * first speaker of the day, including when the anchor seat's player died
+   * during BALAGAN and the next alive seat opened the day (ADR 0007).
    */
   private firstSpeakerId = "";
 
   /**
    * Has the current day's first speaker nominated an elimination candidate?
-   * Reset by `startSpeeches`; set when the first speaker calls `nominate`.
+   * Reset by `enterDaySpeeches`; set when the first speaker calls `nominate`.
    * On Day 2+ the engine rejects `nextSpeaker` when this is still false at
    * the end of the first speaker's speech (ticket 07 — first-word rule).
    */
@@ -368,7 +374,11 @@ export class Engine {
     return this.defenseOrder[this.currentDefenseIndex];
   }
 
-  /** Day cycle: alive non-host players in seat order (frozen at startSpeeches). */
+  /**
+   * Day cycle: alive non-host players in seat order, frozen when speeches
+   * begin (`enterDaySpeeches`). Empty during Day 2+ BALAGAN — the roster is
+   * not frozen until the debate ends (ADR 0007). Test-only consumers.
+   */
   getSpeakingOrder(): string[] {
     return [...this.speakingOrder];
   }
@@ -821,22 +831,18 @@ export class Engine {
 
   /**
    * Add `targetId` to the day's nomination list. Valid during DAY_SPEECHES
-   * (Day 1) and during DAY_BALAGAN (Day 2+ — out of scope here, but the phase
-   * guard matches the future ticket 07).
+   * only, on all days — nominations during DAY_BALAGAN are rejected (ADR 0007;
+   * the previous DAY_BALAGAN acceptance was speculative future-proofing).
    *
    * The actor must be alive; the target must be alive and not already
    * nominated. Players self-nominating is allowed (a player may volunteer for
    * the chop).
    */
   nominate(actorSessionId: string, targetId: string): void {
-    // Day 1 has only DAY_SPEECHES; Day 2+ uses DAY_SPEECHES or DAY_BALAGAN.
-    if (
-      this.state.phase !== GamePhase.DAY_SPEECHES &&
-      this.state.phase !== GamePhase.DAY_BALAGAN
-    ) {
+    if (this.state.phase !== GamePhase.DAY_SPEECHES) {
       throw new EngineError(
         EngineErrorCode.WRONG_PHASE,
-        `nominate requires phase DAY_SPEECHES or DAY_BALAGAN, currently ${this.state.phase}`,
+        `nominate requires phase DAY_SPEECHES, currently ${this.state.phase}`,
       );
     }
     this.requireAlivePlayer(actorSessionId);
@@ -868,27 +874,33 @@ export class Engine {
   }
 
   /**
-   * Open the day's speech round. The single public entry into DAY_SPEECHES:
-   * validates that the day is in DAY_ANNOUNCEMENT, then delegates the work to
-   * `enterDaySpeeches` on every day.
+   * Open the day after the announcement. The single public host control for
+   * the post-announcement press: validates DAY_ANNOUNCEMENT, then dispatches
+   * by day — Day 1 enters DAY_SPEECHES directly (ADR 0005, no BALAGAN on
+   * Day 1); Day 2+ enters DAY_BALAGAN first (ADR 0007), and the speech round
+   * begins when BALAGAN ends (timer expiry or host `skipPhase`). The speaking
+   * roster freezes at that later point, not here.
    */
   startSpeeches(): void {
     this.requirePhase(GamePhase.DAY_ANNOUNCEMENT);
-    this.enterDaySpeeches();
+    if (this.state.dayCount >= 2) {
+      this.enterDayBalagan();
+    } else {
+      this.enterDaySpeeches();
+    }
   }
 
   /**
    * Advance to the next speaker in the clockwise order. When all speakers are
-   * done, auto-transition to DAY_BALAGAN (Day 2+) or DAY_DEFENSE (Day 1).
-   *
-   * Day 2+ inserts BALAGAN between speeches and defense per ADR 0005 / ticket
-   * 07. Day 1 (the first day) still skips BALAGAN.
+   * done, auto-transition to DAY_DEFENSE on every day (ADR 0007 — BALAGAN now
+   * precedes speeches on Day 2+, so it is never entered from here).
    *
    * First-word rule (Day 2+): the first speaker must nominate an elimination
    * candidate during their speech. When `nextSpeaker` is called to end that
    * speech and they haven't nominated, the call is rejected with WRONG_PHASE
-   * — the day cannot advance to BALAGAN until the first speaker fulfils the
-   * nomination requirement. Day 1 has no such requirement.
+   * — the speech round cannot end (the advance to DAY_DEFENSE is blocked)
+   * until the first speaker fulfils the nomination requirement. Day 1 has no
+   * such requirement.
    */
   nextSpeaker(): void {
     this.requirePhase(GamePhase.DAY_SPEECHES);
@@ -908,14 +920,9 @@ export class Engine {
 
     this.currentSpeakerIndex += 1;
     if (this.currentSpeakerIndex >= this.speakingOrder.length) {
-      // All speeches done. Day 2+ inserts BALAGAN before defense; Day 1
-      // skips straight to defense per ADR 0005.
+      // All speeches done — straight to defense on all days (ADR 0007).
       this.clearTimer();
-      if (this.state.dayCount >= 2) {
-        this.enterDayBalagan();
-      } else {
-        this.enterDayDefense();
-      }
+      this.enterDayDefense();
       return;
     }
     this.state.currentSpeakerId = this.getCurrentSpeaker();
@@ -1489,10 +1496,12 @@ export class Engine {
   }
 
   /**
-   * Enter DAY_DEFENSE from DAY_SPEECHES. Computes the defense order from the
-   * nominations and points at the first defender. If no one was nominated,
-   * the engine enters DAY_DEFENSE with an empty defense order; the first
-   * nextDefense() call will immediately move to DAY_VOTING.
+   * Enter DAY_DEFENSE from DAY_SPEECHES. Entered when the speech round ends,
+   * on every day (ADR 0007 — on Day 2+ the BALAGAN expiry/skip routes now
+   * open speeches instead of jumping here). Computes the defense order from
+   * the nominations and points at the first defender. If no one was
+   * nominated, the engine enters DAY_DEFENSE with an empty defense order; the
+   * first nextDefense() call will immediately move to DAY_VOTING.
    */
   private enterDayDefense(): void {
     this.defenseOrder = this.computeDefenseOrder();
@@ -1520,6 +1529,12 @@ export class Engine {
    * speaker is pointed at, and `state.currentSpeakerId` is written so clients
    * can render the speaker badge.
    *
+   * Entered from DAY_ANNOUNCEMENT (Day 1, via `startSpeeches`) or from
+   * DAY_BALAGAN (Day 2+, via `onTimerExpired`/`skipPhase` — ADR 0007). On
+   * Day 2+ the order is computed after BALAGAN, so players who died during
+   * the debate are excluded from the roster, and the rotation anchor recorded
+   * here is the actual first speaker of the day.
+   *
    * On Day 2+ (`dayCount >= 2`) the speaking order is rotated so the first
    * speaker is the seat immediately clockwise from the previous day's first
    * speaker — the "first-word right shifts clockwise" rule (ticket 07). The
@@ -1528,8 +1543,9 @@ export class Engine {
    * Resets `firstSpeakerNominated` so the new day's first speaker must
    * nominate afresh (or not at all, on Day 1).
    *
-   * Private and unguarded, like the other phase-entry methods; its only
-   * caller is `startSpeeches`, which owns the DAY_ANNOUNCEMENT guard.
+   * Private and unguarded, like the other phase-entry methods; its callers
+   * (`startSpeeches` on Day 1, the BALAGAN expiry/skip handlers on Day 2+)
+   * own the phase guards.
    */
   private enterDaySpeeches(): void {
     this.speakingOrder = this.computeSpeakingOrder();
@@ -1558,13 +1574,15 @@ export class Engine {
   }
 
   /**
-   * Enter DAY_BALAGAN from DAY_SPEECHES (Day 2+ only — Day 1 skips BALAGAN
-   * per ADR 0005). Arms the 90s BALAGAN timer; expiry auto-transitions to
-   * DAY_DEFENSE (see `onTimerExpired`), and the host can `skipPhase` to end
-   * the debate early.
+   * Enter DAY_BALAGAN from DAY_ANNOUNCEMENT via `startSpeeches` (Day 2+ only
+   * — Day 1 skips BALAGAN per ADR 0005; ADR 0007 places the debate before the
+   * speeches). Arms the 90s BALAGAN timer; expiry auto-transitions to
+   * DAY_SPEECHES (see `onTimerExpired`), and the host can `skipPhase` to open
+   * the speeches early.
    *
-   * `nominate` is also valid during BALAGAN — the phase guard in
-   * `nominate` already accepts both `DAY_SPEECHES` and `DAY_BALAGAN`.
+   * BALAGAN is a mechanics-free open discussion: no ordered turns and no
+   * nominations — `nominate` is NOT valid during BALAGAN (ADR 0007; the
+   * phase guard accepts DAY_SPEECHES only).
    */
   private enterDayBalagan(): void {
     this.state.phase = GamePhase.DAY_BALAGAN;
@@ -1623,7 +1641,7 @@ export class Engine {
     // `firstSpeakerId` and `firstSpeakerNominated` are intentionally NOT
     // reset here — `firstSpeakerId` carries across days so Day N+1's
     // rotation can anchor on Day N's first speaker. `firstSpeakerNominated`
-    // is reset by `startSpeeches` for the new day.
+    // is reset by `enterDaySpeeches` for the new day.
   }
 
   private logEntry(entry: Omit<ActionLogEntry, "id" | "timestamp" | "phase" | "dayCount" | "nightStep">): void {
@@ -1718,7 +1736,8 @@ export class Engine {
    * - per-turn phases (SPEECH_TURN, DEFENSE_TURN) → call the matching advance,
    *   which either restarts the timer (next turn) or auto-transitions to the
    *   next phase (round complete).
-   * - BALAGAN → enter DAY_DEFENSE (no-op for Day 1; wired in ticket 07).
+   * - BALAGAN → enter DAY_SPEECHES (Day 2+ only — Day 1 never arms BALAGAN;
+   *   ADR 0007 places the debate before the speeches).
    * - MAFIA_WINDOW → pause indefinitely per spec; resume re-arms a fresh
    *   60s window so the host can keep nudging.
    */
@@ -1733,10 +1752,10 @@ export class Engine {
         this.nextDefense();
         break;
       case "BALAGAN":
-        // Day 2+ inserts BALAGAN between speeches and defense; its expiry
-        // advances into DAY_DEFENSE.
+        // ADR 0007: the debate opens the day on Day 2+; its expiry opens the
+        // speech round (and freezes the speaking roster).
         this.phaseTimer = null;
-        this.enterDayDefense();
+        this.enterDaySpeeches();
         break;
       case "MAFIA_WINDOW":
         // Spec: if no victim by the deadline, the phase pauses indefinitely.
@@ -1820,9 +1839,9 @@ export class Engine {
         // submit a victim or hold the pause.
         break;
       case "BALAGAN":
-        // Day 2+ inserts BALAGAN between speeches and defense; skipping
-        // jumps straight to DAY_DEFENSE.
-        this.enterDayDefense();
+        // ADR 0007: skipping the debate opens the speech round (and freezes
+        // the speaking roster).
+        this.enterDaySpeeches();
         break;
     }
   }

@@ -125,7 +125,7 @@ Build the complete Mafia game loop in a pure engine module (`src/game/Engine.ts`
 
 ### Enums
 
-- `GamePhase` day-phase order is fixed: `DAY_SPEECHES → DAY_BALAGAN → DAY_DEFENSE → DAY_VOTING`. ADR 0005.
+- `GamePhase` day-phase order is fixed. Day 2+: `DAY_ANNOUNCEMENT → DAY_BALAGAN → DAY_SPEECHES → DAY_DEFENSE → DAY_VOTING`; Day 1 omits `DAY_BALAGAN`. ADR 0005, ADR 0007.
 - A new `NightStep` enum tracks the active sub-step inside `NIGHT`.
 
 ### Role distribution
@@ -159,7 +159,7 @@ Build the complete Mafia game loop in a pure engine module (`src/game/Engine.ts`
 - Server timers drive phase advancement. The host can override: `pause`, `resume`, `skipPhase`, `extendPhase{seconds}`.
 - On Night 1 the engine walks through `MAFIA → DON → SHERIFF → DOCTOR → RESOLVE` without collecting any actions, then transitions to `DAY_ANNOUNCEMENT` with `dayCount = 1`.
 - From Night 2 onward, the engine collects actions in order: `MAFIA → DON → SHERIFF → DOCTOR → RESOLVE`, and resolves the night when all four are submitted.
-- Day 1's sequence is `DAY_ANNOUNCEMENT → DAY_SPEECHES → DAY_DEFENSE → DAY_VOTING`. Day 2+ inserts `DAY_BALAGAN` between speeches and defense.
+- Day 1's sequence is `DAY_ANNOUNCEMENT → DAY_SPEECHES → DAY_DEFENSE → DAY_VOTING`. Day 2+ runs `DAY_ANNOUNCEMENT → DAY_BALAGAN → DAY_SPEECHES → DAY_DEFENSE → DAY_VOTING` — BALAGAN precedes speeches (ADR 0007).
 
 ### Disconnection
 
@@ -223,5 +223,5 @@ Tests must cover at least:
 ## Further Notes
 
 - The vertical slice is the first deliverable. It implements only Night 2: mafia victim selection (host-confirmed), Don/Sheriff checks (stubs that record but don't resolve), Doctor heal (with restriction), and resolution to `state.died`. Day phases, voting, victory detection, phase timers, and disconnect handling are follow-up tickets on the same feature.
-- This spec was synthesized from a five-round grilling session that locked in: non-playing host with manual controls, role distribution per player count, no-chat ping-based coordination, host-confirmed mafia victim, host-only action log, immediate check delivery, 60s mafia window with host reminders, Day 1 without BALAGAN, no-abstain voting with last-speaker default, configurable revote cap with host arbitration, role privacy until `GAME_OVER`, and disconnect-pause-with-host-resume. See `docs/adr/0001` through `docs/adr/0006` for the binding decisions.
+- This spec was synthesized from a five-round grilling session that locked in: non-playing host with manual controls, role distribution per player count, no-chat ping-based coordination, host-confirmed mafia victim, host-only action log, immediate check delivery, 60s mafia window with host reminders, Day 1 without BALAGAN, BALAGAN before speeches on Day 2+, no-abstain voting with last-speaker default, configurable revote cap with host arbitration, role privacy until `GAME_OVER`, and disconnect-pause-with-host-resume. See `docs/adr/0001` through `docs/adr/0007` for the binding decisions.
 - The seaming for tests: integration via the existing `colyseus.createRoom` API plus engine-level unit tests. No new test framework or test seam is introduced.

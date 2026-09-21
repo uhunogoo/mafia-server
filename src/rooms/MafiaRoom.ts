@@ -148,6 +148,9 @@ export class MafiaRoom extends Room {
       if (!this.requireHost(client)) return;
       this.runEngine(() => this.engine.resolveNight(), client);
     },
+    // ADR 0007: the host's start-speeches press opens the day — on Day 2+ it
+    // enters DAY_BALAGAN (the 90s free debate); on Day 1 it starts the speech
+    // round directly. Message name and routing unchanged.
     startSpeeches: (client: Client) => {
       if (!this.requireHost(client)) return;
       this.runEngine(() => this.engine.startSpeeches(), client);

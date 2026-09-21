@@ -1,6 +1,6 @@
 # ADR 0005: Day 1 has no BALAGAN phase (deviation from rules.md)
 
-- Status: Accepted
+- Status: Accepted (amended by ADR 0007 — Day 2+ position only; the Day-1 exclusion stands)
 - Date: 2026-09-19
 
 ## Context
@@ -40,3 +40,7 @@ Day 2 onwards uses the full sequence:
 
 - **Follow rules.md exactly** — always run BALAGAN. Rejected: empty debate is wasted time.
 - **Replace BALAGAN with a shorter "ice-breaker" round** — adds a new phase type just for Day 1, complicates the state machine for no clear gain.
+
+## Amendment (2026-09-20)
+
+ADR 0007 moves `DAY_BALAGAN` before `DAY_SPEECHES` on Day 2+ and closes nominations during BALAGAN. The decision recorded here — Day 1 has no BALAGAN — is unaffected. The Day 2+ sequence listed above is superseded by ADR 0007.
