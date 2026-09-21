@@ -1,6 +1,6 @@
 import { type Client, ServerError, ErrorCode } from "@colyseus/core";
 import type { MafiaRoom } from "../rooms/MafiaRoom.js";
-import { Player } from "../rooms/schema/MafiaState.js";
+import { Player } from "../schema/PlayerState.js";
 
 export interface AuthPayload {
   name: string;
