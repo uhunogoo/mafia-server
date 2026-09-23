@@ -1,18 +1,29 @@
+/**
+ * Game phases
+ */
 export enum GamePhase {
+  // System
   LOBBY = "LOBBY",
+  GAME_OVER = "GAME_OVER",
 
-  // *** begin game loop cycle
-  NIGHT = "NIGHT",
-  DAY_ANNOUNCEMENT = "DAY_ANNOUNCEMENT", // Оголошення жертв
-  DAY_BALAGAN = "DAY_BALAGAN",           // Вільні суперечки
-  DAY_SPEECHES = "DAY_SPEECHES",         // Промови
-  DAY_DEFENSE = "DAY_DEFENSE",           // Захист кандидатів
-  DAY_VOTING = "DAY_VOTING",             // Голосування
-  // *** end game loop cycle
+  // Night
+  NIGHT_MAFIA = "NIGHT_MAFIA",
+  NIGHT_DON_CHECK = "NIGHT_DON_CHECK",
+  NIGHT_SHERIFF_CHECK = "NIGHT_SHERIFF_CHECK",
+  NIGHT_DOCTOR_HEAL = "NIGHT_DOCTOR_HEAL",
 
-  GAME_OVER = "GAME_OVER"
+  // Day
+  DAY_ANNOUNCE = "DAY_ANNOUNCE",
+  DAY_BALAGAN = "DAY_BALAGAN",
+  DAY_SPEECHES = "DAY_SPEECHES",
+  DAY_DEFENSE = "DAY_DEFENSE",
+  DAY_VOTE = "DAY_VOTE",
+  DAY_REVOTE = "DAY_REVOTE",
 }
 
+/**
+ * Players
+ */
 export enum Role {
   CIVILIAN = "CIVILIAN",
   SHERIFF = "SHERIFF",
