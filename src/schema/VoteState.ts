@@ -8,5 +8,4 @@ export class VoteCandidateState extends Schema {
 export class VoteState extends Schema {
   @type([VoteCandidateState]) candidates = new ArraySchema<VoteCandidateState>();
   @type("number") abstains: number = 0; // Votes for last
-  @type("string") stage: string = "primary"; // // "primary" or "revote"
 }

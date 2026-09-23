@@ -1,6 +1,6 @@
 import { Schema, type, view } from "@colyseus/schema";
-
-export const OWNER_VIEW_TAG = 1;
+import { Role, Team } from "./enums.js";
+import { VIEW_OWNER } from "./viewRules.js";
 
 export class PlayerState extends Schema {
   @type("string") sessionId: string = "";
@@ -11,9 +11,9 @@ export class PlayerState extends Schema {
   @type("boolean") isConnected: boolean = true;
 
   // Rest of the logic
-  @view(OWNER_VIEW_TAG)
-  @type("string") role: string = "";
+  @view(VIEW_OWNER)
+  @type("string") role: Role = Role.CIVILIAN;
 
-  @view(OWNER_VIEW_TAG)
-  @type("string") team: string = "";
+  @view(VIEW_OWNER)
+  @type("string") team: Team = Team.RED;
 }
